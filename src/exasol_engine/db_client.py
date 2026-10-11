@@ -401,7 +401,7 @@ class ChakanExasolClient:
                 }
             ]
         )
-        updated = pd.concat([ov_df, new_row], ignore_index=True)
+        updated = new_row if len(ov_df) == 0 else pd.concat([ov_df, new_row], ignore_index=True)
         self.tables["ASN_PLANNER_OVERRIDES"] = updated
         updated.to_csv(self.data_dir / "asn_planner_overrides.csv", index=False)
 
@@ -415,3 +415,30 @@ class ChakanExasolClient:
                 pass
 
         return round((time.perf_counter() - t0) * 1000.0, 2)
+
+    def reset_planner_overrides(self) -> float:
+        t0 = time.perf_counter()
+        self.ensure_data_loaded()
+        empty_ov = pd.DataFrame(
+            columns=[
+                "asn_line_id",
+                "resolved_part_num",
+                "normalized_qty",
+                "normalized_uom",
+                "normalized_eta_date",
+                "resolution_action",
+                "resolved_by",
+                "resolved_at",
+            ]
+        )
+        self.tables["ASN_PLANNER_OVERRIDES"] = empty_ov
+        empty_ov.to_csv(self.data_dir / "asn_planner_overrides.csv", index=False)
+
+        if self.conn is not None:
+            try:
+                self.conn.execute(f"TRUNCATE TABLE {self.schema}.ASN_PLANNER_OVERRIDES")
+            except Exception:
+                pass
+
+        return round((time.perf_counter() - t0) * 1000.0, 2)
+

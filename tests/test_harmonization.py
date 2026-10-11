@@ -47,3 +47,23 @@ def test_blast_radius_analytical_marts(tmp_path) -> None:
     assert "CRITICAL_SHORT_SHIPMENT_EXPOSED" in verdicts
     assert "FALSE_STARVATION_CLEARED_BY_UDF" in verdicts
     assert "DUPLICATE_PAYLOAD_SUPPRESSED" in verdicts
+
+    initial_net_risk = float(marts["bom_risk_mart"]["revenue_at_risk_net_inr"].sum())
+    assert initial_net_risk > 0
+
+    client.approve_harmonization_override(
+        asn_line_id="ASN-L-9011",
+        resolved_part_num="AXL-HUB-DUC-14",
+        normalized_qty=600.0,
+        normalized_uom="EA",
+        normalized_eta_date="2026-10-12",
+        action="EXPEDITED_SHORTFALL_COVERED",
+    )
+    updated_marts = client.compute_analytical_marts()
+    updated_net_risk = float(updated_marts["bom_risk_mart"]["revenue_at_risk_net_inr"].sum())
+    assert updated_net_risk < initial_net_risk
+
+    client.reset_planner_overrides()
+    reset_marts = client.compute_analytical_marts()
+    assert float(reset_marts["bom_risk_mart"]["revenue_at_risk_net_inr"].sum()) == initial_net_risk
+
