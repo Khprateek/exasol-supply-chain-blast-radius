@@ -98,6 +98,8 @@ All datasets in this repository are **100% synthetic** and generated programmati
 │       ├── blast_radius_marts.sql   # Analytical views for ATP, ASN lineage & BOM starvation risk
 │       ├── harmonizer_core.py       # Shared Python harmonization routines
 │       └── db_client.py             # pyexasol loader, query runner & interactive override handler
+│   └── app/
+│       └── app.py                   # Streamlit Materials Planner Triage & Resolution Cockpit
 └── tests/
     └── test_harmonization.py        # Unit tests for UDF logic and blast-radius calculations
 ```
@@ -128,6 +130,11 @@ python -m src.data_generator.generate_all
 ### 4. Run Automated Tests
 ```bash
 python -m pytest -q
+```
+
+### 5. Launch the Materials Planner Triage Cockpit
+```bash
+streamlit run src/app/app.py
 ```
 
 ---
