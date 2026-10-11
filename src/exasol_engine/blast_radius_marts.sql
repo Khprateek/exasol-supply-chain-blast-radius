@@ -1,0 +1,199 @@
+-- Exasol Personal Analytical Views: Phantom Inventory, ASN Lineage & BOM Blast-Radius Engine
+-- Target Schema: CHAKAN_SCM
+
+OPEN SCHEMA CHAKAN_SCM;
+
+-- 1. True Available-to-Promise (ATP) & Phantom Inventory Reconciliation View
+CREATE OR REPLACE VIEW CHAKAN_SCM.VW_INVENTORY_TRUE_ATP AS
+SELECT
+    w.ledger_id,
+    w.facility_code,
+    w.storage_bin_id,
+    w.internal_part_num,
+    i.part_description,
+    i.part_category,
+    i.base_uom,
+    i.standard_cost_inr,
+    i.safety_stock_qty,
+    w.erp_system_on_hand_qty,
+    w.wms_physical_counted_qty,
+    w.allocated_to_prod_qty,
+    w.quality_hold_qty,
+    (w.erp_system_on_hand_qty - w.wms_physical_counted_qty) AS phantom_inventory_qty,
+    ROUND((w.erp_system_on_hand_qty - w.wms_physical_counted_qty) * i.standard_cost_inr, 2) AS phantom_inventory_value_inr,
+    GREATEST(0, w.erp_system_on_hand_qty - w.allocated_to_prod_qty) AS erp_apparent_atp_qty,
+    GREATEST(0, w.wms_physical_counted_qty - w.allocated_to_prod_qty - w.quality_hold_qty) AS true_pickable_atp_qty,
+    w.last_cycle_count_ts
+FROM CHAKAN_SCM.WAREHOUSE_INVENTORY_LEDGER w
+JOIN CHAKAN_SCM.ITEM_MASTER i
+    ON w.internal_part_num = i.internal_part_num;
+
+-- 2. In-Database UDF Harmonized ASN Lineage View (With Deduplication & Planner Overrides)
+CREATE OR REPLACE VIEW CHAKAN_SCM.VW_ASN_HARMONIZED_LINEAGE AS
+WITH deduplicated_asn AS (
+    SELECT
+        a.*,
+        ROW_NUMBER() OVER (
+            PARTITION BY a.asn_number, a.po_number_ref, a.raw_supplier_sku, a.raw_shipped_qty
+            ORDER BY a.ingested_at ASC
+        ) AS transmission_seq
+    FROM CHAKAN_SCM.ASN_LINES_RAW a
+),
+sku_resolved AS (
+    SELECT
+        d.asn_line_id,
+        d.asn_number,
+        d.supplier_id,
+        d.po_number_ref,
+        d.po_line_number_ref,
+        d.raw_supplier_sku,
+        d.raw_shipped_qty,
+        d.raw_shipped_uom,
+        d.raw_shipment_date,
+        d.raw_eta_date,
+        d.carrier_name,
+        d.vehicle_lorry_no,
+        d.source_format,
+        d.legacy_etl_status,
+        d.anomaly_type,
+        d.ingested_at,
+        d.transmission_seq,
+        p.internal_part_num AS po_part_num,
+        p.ordered_qty AS po_ordered_qty,
+        p.ordered_uom AS po_ordered_uom,
+        s.supplier_name,
+        s.tier_level,
+        s.default_date_format,
+        CHAKAN_SCM.UDF_RESOLVE_SUPPLIER_SKU(d.raw_supplier_sku, p.internal_part_num)
+    FROM deduplicated_asn d
+    LEFT JOIN CHAKAN_SCM.PURCHASE_ORDER_LINES p
+        ON d.po_number_ref = p.po_number
+       AND COALESCE(d.po_line_number_ref, 1) = p.line_number
+    LEFT JOIN CHAKAN_SCM.SUPPLIER_MASTER s
+        ON d.supplier_id = s.supplier_id
+)
+SELECT
+    sr.asn_line_id,
+    sr.asn_number,
+    sr.supplier_id,
+    sr.supplier_name,
+    sr.tier_level,
+    sr.po_number_ref,
+    COALESCE(ov.resolved_part_num, sr.resolved_part_num) AS internal_part_num,
+    sr.raw_supplier_sku,
+    sr.sku_match_method,
+    sr.sku_confidence,
+    sr.raw_shipped_qty,
+    sr.raw_shipped_uom,
+    im.base_uom AS canonical_uom,
+    CASE
+        WHEN sr.transmission_seq > 1 THEN 0.0
+        WHEN ov.normalized_qty IS NOT NULL THEN ov.normalized_qty
+        ELSE CHAKAN_SCM.UDF_NORMALIZE_UOM(
+            sr.raw_shipped_qty,
+            sr.raw_shipped_uom,
+            im.base_uom,
+            im.standard_pack_size_ea,
+            im.unit_weight_kg
+        )
+    END AS harmonized_shipped_qty,
+    CASE
+        WHEN sr.legacy_etl_status = 'ACCEPTED' AND sr.transmission_seq = 1 THEN sr.raw_shipped_qty
+        ELSE 0.0
+    END AS legacy_visible_qty,
+    sr.raw_shipment_date,
+    sr.raw_eta_date,
+    COALESCE(
+        ov.normalized_eta_date,
+        CHAKAN_SCM.UDF_PARSE_ASN_DATE(sr.raw_eta_date, sr.default_date_format)
+    ) AS harmonized_eta_date,
+    sr.carrier_name,
+    sr.vehicle_lorry_no,
+    sr.source_format,
+    sr.legacy_etl_status,
+    CASE
+        WHEN sr.transmission_seq > 1 THEN 'DUPLICATE_SUPPRESSED'
+        WHEN ov.resolution_action IS NOT NULL THEN ov.resolution_action
+        WHEN sr.legacy_etl_status = 'ACCEPTED' THEN 'CLEAN_INGESTED'
+        ELSE 'UDF_HARMONIZED_PENDING_APPROVAL'
+    END AS harmonization_state,
+    sr.anomaly_type,
+    sr.ingested_at
+FROM sku_resolved sr
+LEFT JOIN CHAKAN_SCM.ITEM_MASTER im
+    ON COALESCE(sr.resolved_part_num, sr.po_part_num) = im.internal_part_num
+LEFT JOIN CHAKAN_SCM.ASN_PLANNER_OVERRIDES ov
+    ON sr.asn_line_id = ov.asn_line_id;
+
+-- 3. BOM Explosion & Assembly Line Starvation Risk View
+CREATE OR REPLACE VIEW CHAKAN_SCM.VW_BOM_LINE_STARVATION_RISK AS
+WITH po_asn_rollup AS (
+    SELECT
+        p.po_number,
+        p.internal_part_num,
+        p.supplier_id,
+        p.ordered_qty,
+        p.ordered_uom,
+        p.promised_delivery_date,
+        COALESCE(SUM(h.legacy_visible_qty), 0.0) AS legacy_inbound_qty,
+        COALESCE(SUM(h.harmonized_shipped_qty), 0.0) AS harmonized_inbound_qty,
+        COUNT(h.asn_line_id) AS asn_shipment_count
+    FROM CHAKAN_SCM.PURCHASE_ORDER_LINES p
+    LEFT JOIN CHAKAN_SCM.VW_ASN_HARMONIZED_LINEAGE h
+        ON p.po_number = h.po_number_ref
+    WHERE p.po_line_status = 'OPEN'
+    GROUP BY
+        p.po_number,
+        p.internal_part_num,
+        p.supplier_id,
+        p.ordered_qty,
+        p.ordered_uom,
+        p.promised_delivery_date
+)
+SELECT
+    ps.schedule_id,
+    ps.assembly_line_id,
+    ps.assembly_line_name,
+    ps.parent_part_num,
+    ps.planned_output_units,
+    ps.finished_unit_value_inr,
+    ps.downtime_burn_rate_inr_hr,
+    b.component_part_num,
+    im.part_description AS component_description,
+    im.base_uom,
+    im.standard_cost_inr,
+    b.assembly_station_code,
+    b.qty_per_assembly,
+    ROUND(ps.planned_output_units * b.qty_per_assembly * (1.0 + b.scrap_allowance_pct), 2) AS gross_required_qty,
+    ROUND((ps.planned_output_units * b.qty_per_assembly * (1.0 + b.scrap_allowance_pct)) / 48.0, 2) AS hourly_burn_qty,
+    inv.erp_apparent_atp_qty,
+    inv.true_pickable_atp_qty,
+    inv.phantom_inventory_qty,
+    pa.po_number,
+    pa.supplier_id,
+    pa.ordered_qty AS po_ordered_qty,
+    pa.legacy_inbound_qty,
+    pa.harmonized_inbound_qty,
+    GREATEST(0.0, pa.ordered_qty - pa.harmonized_inbound_qty) AS supplier_short_shipped_qty,
+    (inv.true_pickable_atp_qty + pa.legacy_inbound_qty) AS legacy_total_available_qty,
+    (inv.true_pickable_atp_qty + pa.harmonized_inbound_qty) AS harmonized_total_available_qty,
+    GREATEST(0.0, ROUND(ps.planned_output_units * b.qty_per_assembly * (1.0 + b.scrap_allowance_pct), 2) - (inv.true_pickable_atp_qty + pa.legacy_inbound_qty)) AS legacy_deficit_qty,
+    GREATEST(0.0, ROUND(ps.planned_output_units * b.qty_per_assembly * (1.0 + b.scrap_allowance_pct), 2) - (inv.true_pickable_atp_qty + pa.harmonized_inbound_qty)) AS true_net_deficit_qty,
+    ROUND(
+        LEAST(48.0, (inv.true_pickable_atp_qty + pa.legacy_inbound_qty) / NULLIF((ps.planned_output_units * b.qty_per_assembly * (1.0 + b.scrap_allowance_pct)) / 48.0, 0)),
+        1
+    ) AS hours_to_starvation_legacy,
+    ROUND(
+        LEAST(48.0, (inv.true_pickable_atp_qty + pa.harmonized_inbound_qty) / NULLIF((ps.planned_output_units * b.qty_per_assembly * (1.0 + b.scrap_allowance_pct)) / 48.0, 0)),
+        1
+    ) AS hours_to_starvation_harmonized
+FROM CHAKAN_SCM.PRODUCTION_SCHEDULES ps
+JOIN CHAKAN_SCM.BILL_OF_MATERIALS b
+    ON ps.parent_part_num = b.parent_part_num
+   AND b.bom_level = 1
+JOIN CHAKAN_SCM.ITEM_MASTER im
+    ON b.component_part_num = im.internal_part_num
+LEFT JOIN CHAKAN_SCM.VW_INVENTORY_TRUE_ATP inv
+    ON b.component_part_num = inv.internal_part_num
+LEFT JOIN po_asn_rollup pa
+    ON b.component_part_num = pa.internal_part_num;
