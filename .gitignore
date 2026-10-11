@@ -1,0 +1,40 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Environment variables & secrets
+.env
+.env.*
+!.env.example
+
+# Local development notes, scratchpads & reference dumps
+.local_notes/
+scratch/
+*.bak
+*.tmp
+
+# Generated data artifacts & local database dumps
+data/raw/
+data/processed/
+data/exports/
+*.parquet
+*.db
+*.sqlite3
+
+# dbt artifacts
+target/
+dbt_packages/
+logs/
+
+# IDE & OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
