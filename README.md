@@ -56,21 +56,22 @@ flowchart LR
 
 ### Key Exasol Personal Capabilities Used
 1. **Distribution-Aligned Schema Design (`src/exasol_engine/ddl_schema.sql`):**
-   - Uses `DISTRIBUTE BY internal_part_num` and `DISTRIBUTE BY po_number_ref` across core tables (`ITEM_MASTER`, `BILL_OF_MATERIALS`, `PURCHASE_ORDER_LINES`, `WAREHOUSE_INVENTORY_LEDGER`, `ASN_LINES_RAW`) to co-locate joins inside Exasol.
+   - Uses `DISTRIBUTE BY (internal_part_num)` (`ITEM_MASTER`, `PURCHASE_ORDER_LINES`, `WAREHOUSE_INVENTORY_LEDGER`), `DISTRIBUTE BY (component_part_num)` (`BILL_OF_MATERIALS`), `DISTRIBUTE BY (parent_part_num)` (`PRODUCTION_SCHEDULES`), and `DISTRIBUTE BY (po_number_ref)` (`ASN_LINES_RAW`) to align part-level joins inside Exasol.
 2. **In-Database Python 3 Scalar UDFs (`src/exasol_engine/udfs_harmonization.sql`):**
    - `CHAKAN_SCM.UDF_NORMALIZE_UOM`: Converts packaging strings (`BOX_100`, `BAG_250`, `CRATE_40`, `CRATE_50`) and weight inversions (`MT` to `KG`, or `MT` to `EA` via component unit weight) into canonical `ITEM_MASTER.base_uom`.
-   - `CHAKAN_SCM.UDF_RESOLVE_SUPPLIER_SKU`: Multi-emit Python UDF (`EMITS (resolved_part_num, sku_match_method, sku_confidence)`) resolving stripped hyphens, vendor catalog aliases, and token overlap against open POs.
+   - `CHAKAN_SCM.UDF_RESOLVE_SUPPLIER_SKU`: Multi-emit Python UDF (`EMITS (resolved_part_num, sku_match_method, sku_confidence)`) resolving stripped hyphens, vendor catalog aliases, token overlap, and Jaro-Winkler ($\ge 0.85$) fuzzy similarity against open POs.
    - `CHAKAN_SCM.UDF_PARSE_ASN_DATE`: Resolves `DD/MM/YYYY`, `MM/DD/YYYY`, ISO `YYYY-MM-DD`, and Unix epoch timestamps using supplier master format profiles.
 3. **Analytical BOM Explosion & Phantom Inventory Views (`src/exasol_engine/blast_radius_marts.sql`):**
    - `VW_INVENTORY_TRUE_ATP`: Reconciles central ERP balances against physical WMS cycle counts to expose **Phantom Inventory** before calculating Available-to-Promise (ATP).
    - `VW_ASN_HARMONIZED_LINEAGE`: Uses `ROW_NUMBER() OVER (PARTITION BY ...)` to suppress duplicate EDI/CSV retransmissions and applies UDF harmonization alongside planner overrides.
-   - `VW_BOM_LINE_STARVATION_RISK`: Explodes component requirements across active assembly lines, quantifying **Hours Until Line Starvation** and **₹ Production Output at Risk** before and after harmonization.
+   - `VW_BOM_LINE_STARVATION_RISK`: Explodes component requirements across active assembly lines, quantifying **Hours Until Line Starvation**, **₹ Production Output at Risk**, and **Downtime Exposure** before and after harmonization.
+   - `VW_FINANCIAL_ROI_SUMMARY`: Computes executive mitigation ROI (`1,174.7x`) and avoided panic freight (`₹1.35 L`).
 
 ---
 
 ## Synthetic Data Disclosure
 
-All datasets in this repository are **100% synthetic** and generated programmatically via `src/data_generator/`. No proprietary, confidential, or employer data is used. The data generator models realistic Indian automotive powertrain BOM structures (Euro-VI diesel engines, 6-speed AMT gearboxes, heavy rear axles, 200kW EV drive units) and six documented sub-tier supplier data anomalies:
+All datasets in this repository are **100% synthetic** and generated programmatically via `src/data_generator/` (`SEED = 202610`). No proprietary, confidential, or employer data is used. The data generator models realistic Indian automotive powertrain BOM structures (Euro-VI diesel engines, 6-speed AMT gearboxes, heavy rear axles, 200kW EV drive units) and six documented sub-tier supplier data anomalies:
 1. **UOM Conversion Inversion** (`BOX_100`, `BAG_250`, `CRATE_50`, and `MT`-to-`EA` weight dispatches)
 2. **Supplier SKU Identifier Drift** (`6204ZZ` vs `ENG-BRG-6204-01`, stripped hyphens, vendor prefixes)
 3. **Date Format Ambiguity** (`DD/MM/YYYY` vs `MM/DD/YYYY` vs Unix epoch timestamps)
@@ -87,26 +88,32 @@ All datasets in this repository are **100% synthetic** and generated programmati
 ├── README.md
 ├── requirements.txt
 ├── .env.example
+├── docs/
+│   └── run-guide.md                 # End-to-end reproducibility & verification runbook
 ├── src/
 │   ├── data_generator/
 │   │   ├── erp_master_gen.py        # Pune-Chakan suppliers, items, BOMs, POs, inventory & schedules
 │   │   ├── chaos_injector.py        # Inbound MSME ASN chaos generator
 │   │   └── generate_all.py          # CLI utility to generate all CSV tables in data/raw/
-│   └── exasol_engine/
-│       ├── ddl_schema.sql           # Exasol table DDL with DISTRIBUTE BY keys
-│       ├── udfs_harmonization.sql   # Exasol PYTHON3 scalar UDF scripts
-│       ├── blast_radius_marts.sql   # Analytical views for ATP, ASN lineage & BOM starvation risk
-│       ├── harmonizer_core.py       # Shared Python harmonization routines
-│       └── db_client.py             # pyexasol loader, query runner & interactive override handler
+│   ├── exasol_engine/
+│   │   ├── ddl_schema.sql           # Exasol table DDL with DISTRIBUTE BY keys
+│   │   ├── udfs_harmonization.sql   # Exasol PYTHON3 scalar UDF scripts
+│   │   ├── blast_radius_marts.sql   # Analytical views for ATP, ASN lineage & BOM starvation risk
+│   │   ├── harmonizer_core.py       # Shared Python harmonization routines (incl. Jaro-Winkler)
+│   │   └── db_client.py             # Dual-mode Exasol SQL view runner & offline pandas mirror
+│   ├── benchmarks/
+│   │   └── scale_benchmark.py       # 500 to 10,000-row CPU & memory scalability benchmark
 │   └── app/
 │       └── app.py                   # Streamlit Materials Planner Triage & Resolution Cockpit
 └── tests/
-    └── test_harmonization.py        # Unit tests for UDF logic and blast-radius calculations
+    └── test_harmonization.py        # 10 unit & live Exasol parity tests
 ```
 
 ---
 
 ## Setup & Usage
+
+See [`docs/run-guide.md`](docs/run-guide.md) for the complete reproducibility runbook.
 
 ### 1. Install Dependencies
 ```bash
@@ -127,14 +134,14 @@ cp .env.example .env
 python -m src.data_generator.generate_all
 ```
 
-### 4. Run Automated Tests
+### 4. Run Automated Tests (10/10 Unit & Parity Suite)
 ```bash
-python -m pytest -q
+python -m pytest -v
 ```
 
 ### 5. Launch the Materials Planner Triage Cockpit
 ```bash
-streamlit run src/app/app.py
+python -m streamlit run src/app/app.py
 ```
 
 ---
