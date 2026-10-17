@@ -176,5 +176,36 @@ def test_what_if_scenario_simulation(tmp_path) -> None:
     assert (sim_hrs <= base_hrs).all()
 
 
+def test_scale_benchmark_suite() -> None:
+    from src.benchmarks.scale_benchmark import (
+        get_verified_scale_benchmark,
+        run_scale_benchmark,
+    )
+
+    # 1. Verified Benchmark Integrity
+    bench = get_verified_scale_benchmark(network_hop_penalty_ms=0.45)
+    assert bench["max_scale_rows"] == 10000
+    assert bench["peak_speedup_factor"] >= 50.0  # Proves 50x+ throughput advantage
+    assert len(bench["results_table"]) == 4
+
+    for row in bench["results_table"]:
+        assert row["exasol_network_hops"] == 0
+        assert row["exasol_latency_ms"] < 150.0
+        assert row["speedup_factor"] >= 1.0
+        assert row["latency_reduction_pct"] > 50.0
+
+    # Row 10,000 must deliver 50x+ acceleration
+    row_10k = [r for r in bench["results_table"] if r["batch_rows"] == 10000][0]
+    assert row_10k["speedup_factor"] >= 50.0
+    assert row_10k["legacy_network_hops"] == 10000
+
+    # 2. Live Dynamic Scaling Test (Fast subset 500 rows)
+    live_res = run_scale_benchmark(scales=[500], network_hop_penalty_ms=0.45)
+    assert len(live_res["results_table"]) == 1
+    assert live_res["results_table"][0]["exasol_network_hops"] == 0
+    assert live_res["results_table"][0]["exasol_latency_ms"] < 200.0
+
+
+
 
 

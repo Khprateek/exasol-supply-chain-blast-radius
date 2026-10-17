@@ -221,10 +221,42 @@ class ChakanExasolClient:
         harmonized_etas = []
         harm_states = []
 
-        for _, row in asn_joined.iterrows():
-            line_id = str(row["asn_line_id"])
-            po_part = str(row["internal_part_num"]) if pd.notna(row["internal_part_num"]) else None
-            res_sku, method, conf = resolve_supplier_sku(str(row["raw_supplier_sku"]), po_part)
+        asn_line_ids = asn_joined["asn_line_id"].astype(str).tolist()
+        internal_parts = asn_joined["internal_part_num"].tolist()
+        raw_skus = asn_joined["raw_supplier_sku"].astype(str).tolist()
+        ordered_uoms = asn_joined["ordered_uom"].tolist()
+        raw_qtys = asn_joined["raw_shipped_qty"].astype(float).tolist()
+        raw_uoms = asn_joined["raw_shipped_uom"].astype(str).tolist()
+        transmission_seqs = asn_joined["transmission_seq"].astype(int).tolist()
+        legacy_statuses = asn_joined["legacy_etl_status"].astype(str).tolist()
+        raw_dates = asn_joined["raw_eta_date"].astype(str).tolist()
+        date_formats = (
+            asn_joined["default_date_format"].fillna("DD/MM/YYYY").astype(str).tolist()
+            if "default_date_format" in asn_joined.columns
+            else ["DD/MM/YYYY"] * len(asn_joined)
+        )
+
+        sku_cache = {}
+        date_cache = {}
+        uom_cache = {}
+
+        for line_id, po_part, raw_sku, ord_uom, raw_qty, raw_uom, seq, leg_status, raw_date, date_fmt in zip(
+            asn_line_ids,
+            internal_parts,
+            raw_skus,
+            ordered_uoms,
+            raw_qtys,
+            raw_uoms,
+            transmission_seqs,
+            legacy_statuses,
+            raw_dates,
+            date_formats,
+        ):
+            ref_part = str(po_part) if pd.notna(po_part) else None
+            sku_k = (raw_sku, ref_part)
+            if sku_k not in sku_cache:
+                sku_cache[sku_k] = resolve_supplier_sku(raw_sku, ref_part)
+            res_sku, method, conf = sku_cache[sku_k]
 
             if line_id in ov_lookup and pd.notna(ov_lookup[line_id].get("resolved_part_num")):
                 res_sku = str(ov_lookup[line_id]["resolved_part_num"])
@@ -232,11 +264,10 @@ class ChakanExasolClient:
                 conf = 1.00
 
             item_meta = item_lookup.get(res_sku, {})
-            c_uom = str(item_meta.get("base_uom", row["ordered_uom"] if pd.notna(row["ordered_uom"]) else "EA"))
+            c_uom = str(item_meta.get("base_uom", ord_uom if pd.notna(ord_uom) else "EA"))
             pack_sz = float(item_meta.get("standard_pack_size_ea", 1.0))
             u_wt = float(item_meta.get("unit_weight_kg", 1.0))
 
-            seq = int(row["transmission_seq"])
             if seq > 1:
                 h_qty = 0.0
                 state = "DUPLICATE_SUPPRESSED"
@@ -244,21 +275,28 @@ class ChakanExasolClient:
                 h_qty = float(ov_lookup[line_id]["normalized_qty"])
                 state = str(ov_lookup[line_id].get("resolution_action", "PLANNER_APPROVED"))
             else:
-                h_qty = normalize_uom_quantity(
-                    float(row["raw_shipped_qty"]),
-                    str(row["raw_shipped_uom"]),
-                    c_uom,
-                    pack_size_ea=pack_sz,
-                    unit_weight_kg=u_wt,
-                )
+                uom_k = (raw_qty, raw_uom, c_uom, pack_sz, u_wt)
+                if uom_k not in uom_cache:
+                    uom_cache[uom_k] = normalize_uom_quantity(
+                        raw_qty,
+                        raw_uom,
+                        c_uom,
+                        pack_size_ea=pack_sz,
+                        unit_weight_kg=u_wt,
+                    )
+                h_qty = uom_cache[uom_k]
                 state = (
                     "CLEAN_INGESTED"
-                    if str(row["legacy_etl_status"]) == "ACCEPTED"
+                    if leg_status == "ACCEPTED"
                     else "UDF_HARMONIZED_PENDING_APPROVAL"
                 )
 
-            leg_qty = float(row["raw_shipped_qty"]) if (str(row["legacy_etl_status"]) == "ACCEPTED" and seq == 1) else 0.0
-            eta_dt = parse_asn_date(str(row["raw_eta_date"]), str(row.get("default_date_format", "DD/MM/YYYY")))
+            leg_qty = raw_qty if (leg_status == "ACCEPTED" and seq == 1) else 0.0
+
+            dt_k = (raw_date, date_fmt)
+            if dt_k not in date_cache:
+                date_cache[dt_k] = parse_asn_date(raw_date, date_fmt)
+            eta_dt = date_cache[dt_k]
 
             resolved_skus.append(res_sku)
             match_methods.append(method)
