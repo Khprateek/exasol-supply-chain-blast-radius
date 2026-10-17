@@ -68,6 +68,67 @@ def normalize_uom_quantity(
     return round(float(raw_qty), 2)
 
 
+def jaro_winkler_similarity(s1: str, s2: str, prefix_weight: float = 0.1) -> float:
+    """
+    Computes standard Jaro-Winkler string similarity in [0.0, 1.0].
+    Used to resolve near-miss supplier SKU typos (e.g., '0' vs 'O', dropped suffix chars)
+    against canonical item numbers and known vendor catalog aliases.
+    """
+    a = (s1 or "").strip().upper()
+    b = (s2 or "").strip().upper()
+    if a == b:
+        return 1.0 if a else 0.0
+    len_a, len_b = len(a), len(b)
+    if len_a == 0 or len_b == 0:
+        return 0.0
+
+    match_dist = max(0, max(len_a, len_b) // 2 - 1)
+    a_matches = [False] * len_a
+    b_matches = [False] * len_b
+    matches = 0
+
+    for i in range(len_a):
+        start = max(0, i - match_dist)
+        end = min(i + match_dist + 1, len_b)
+        for j in range(start, end):
+            if b_matches[j] or a[i] != b[j]:
+                continue
+            a_matches[i] = True
+            b_matches[j] = True
+            matches += 1
+            break
+
+    if matches == 0:
+        return 0.0
+
+    transpositions = 0
+    k = 0
+    for i in range(len_a):
+        if not a_matches[i]:
+            continue
+        while not b_matches[k]:
+            k += 1
+        if a[i] != b[k]:
+            transpositions += 1
+        k += 1
+
+    jaro = (
+        (matches / len_a)
+        + (matches / len_b)
+        + ((matches - transpositions / 2.0) / matches)
+    ) / 3.0
+
+    prefix = 0
+    for ch_a, ch_b in zip(a[:4], b[:4]):
+        if ch_a == ch_b:
+            prefix += 1
+        else:
+            break
+
+    jw = jaro + prefix * prefix_weight * (1.0 - jaro)
+    return round(min(1.0, jw), 4)
+
+
 def resolve_supplier_sku(raw_sku: str, po_part_num: str | None = None) -> Tuple[str, str, float]:
     """
     Reconciles supplier part identifiers to canonical ITEM_MASTER internal_part_num.
@@ -94,6 +155,23 @@ def resolve_supplier_sku(raw_sku: str, po_part_num: str | None = None) -> Tuple[
         matched_tokens = sum(1 for tok in po_tokens if tok in alnum_raw)
         if po_tokens and matched_tokens >= max(1, len(po_tokens) - 1):
             return cleaned_po, "PO_TOKEN_SIMILARITY", 0.89
+
+        jw_po = jaro_winkler_similarity(alnum_raw, alnum_po)
+        if jw_po >= 0.85:
+            return cleaned_po, "JARO_WINKLER_FUZZY", round(jw_po, 2)
+
+    if alnum_raw:
+        best_alias_sku = None
+        best_jw = 0.0
+        for alias_key, canonical_sku in KNOWN_SUPPLIER_SKU_ALIASES.items():
+            score = jaro_winkler_similarity(alnum_raw, alias_key)
+            if score > best_jw:
+                best_jw = score
+                best_alias_sku = canonical_sku
+        if best_alias_sku and best_jw >= 0.85:
+            return best_alias_sku, "JARO_WINKLER_FUZZY", round(best_jw, 2)
+
+    if cleaned_po:
         return cleaned_po, "PO_LINEAGE_FALLBACK", 0.82
 
     return cleaned_raw, "UNRESOLVED", 0.00

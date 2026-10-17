@@ -72,6 +72,49 @@ ALIASES = {
     "42CRMO4BILLET": "RAW-STL-42CR-B",
 }
 
+def _jaro_winkler(s1, s2, prefix_weight=0.1):
+    a = (s1 or "").strip().upper()
+    b = (s2 or "").strip().upper()
+    if a == b:
+        return 1.0 if a else 0.0
+    len_a, len_b = len(a), len(b)
+    if len_a == 0 or len_b == 0:
+        return 0.0
+    match_dist = max(0, max(len_a, len_b) // 2 - 1)
+    a_matches = [False] * len_a
+    b_matches = [False] * len_b
+    matches = 0
+    for i in range(len_a):
+        start = max(0, i - match_dist)
+        end = min(i + match_dist + 1, len_b)
+        for j in range(start, end):
+            if b_matches[j] or a[i] != b[j]:
+                continue
+            a_matches[i] = True
+            b_matches[j] = True
+            matches += 1
+            break
+    if matches == 0:
+        return 0.0
+    transpositions = 0
+    k = 0
+    for i in range(len_a):
+        if not a_matches[i]:
+            continue
+        while not b_matches[k]:
+            k += 1
+        if a[i] != b[k]:
+            transpositions += 1
+        k += 1
+    jaro = ((matches / len_a) + (matches / len_b) + ((matches - transpositions / 2.0) / matches)) / 3.0
+    prefix = 0
+    for ch_a, ch_b in zip(a[:4], b[:4]):
+        if ch_a == ch_b:
+            prefix += 1
+        else:
+            break
+    return round(min(1.0, jaro + prefix * prefix_weight * (1.0 - jaro)), 4)
+
 def run(ctx):
     cleaned_raw = (ctx.raw_sku or "").strip().upper()
     cleaned_po = (ctx.po_part_num or "").strip().upper()
@@ -97,6 +140,25 @@ def run(ctx):
         if po_tokens and matched >= max(1, len(po_tokens) - 1):
             ctx.emit(cleaned_po, "PO_TOKEN_SIMILARITY", 0.89)
             return
+
+        jw_po = _jaro_winkler(alnum_raw, alnum_po)
+        if jw_po >= 0.85:
+            ctx.emit(cleaned_po, "JARO_WINKLER_FUZZY", round(jw_po, 2))
+            return
+
+    if alnum_raw:
+        best_alias_sku = None
+        best_jw = 0.0
+        for alias_key, canonical_sku in ALIASES.items():
+            score = _jaro_winkler(alnum_raw, alias_key)
+            if score > best_jw:
+                best_jw = score
+                best_alias_sku = canonical_sku
+        if best_alias_sku and best_jw >= 0.85:
+            ctx.emit(best_alias_sku, "JARO_WINKLER_FUZZY", round(best_jw, 2))
+            return
+
+    if cleaned_po:
         ctx.emit(cleaned_po, "PO_LINEAGE_FALLBACK", 0.82)
         return
 
@@ -109,20 +171,25 @@ CREATE OR REPLACE PYTHON3 SCALAR SCRIPT CHAKAN_SCM.UDF_PARSE_ASN_DATE(
     raw_date_str VARCHAR(40) UTF8,
     supplier_date_fmt VARCHAR(20) UTF8
 ) RETURNS DATE AS
-from datetime import date, datetime, timezone
+-- NOTE: do NOT write `from datetime import datetime` here. Exasol's UDF wrapper uses the
+-- module name `datetime` in the same global namespace to convert the DATE return value,
+-- so shadowing it raises "type object 'datetime.datetime' has no attribute 'datetime'".
+import datetime as _dt
 import re
+
+_DEFAULT = _dt.date(2026, 10, 12)
 
 def run(ctx):
     val = (ctx.raw_date_str or "").strip()
     if not val:
-        return date(2026, 10, 12)
+        return _DEFAULT
 
     if re.fullmatch(r"\d{9,10}", val):
-        dt = datetime.fromtimestamp(int(val), tz=timezone.utc).date()
-        return dt if dt.year == 2026 else date(2026, 10, 12)
+        d = _dt.datetime.fromtimestamp(int(val), tz=_dt.timezone.utc).date()
+        return d if d.year == 2026 else _DEFAULT
 
     if re.fullmatch(r"\d{4}-\d{2}-\d{2}", val):
-        return datetime.strptime(val, "%Y-%m-%d").date()
+        return _dt.datetime.strptime(val, "%Y-%m-%d").date()
 
     slash_match = re.fullmatch(r"(\d{1,2})/(\d{1,2})/(\d{4})", val)
     if slash_match:
@@ -131,12 +198,19 @@ def run(ctx):
         year = int(slash_match.group(3))
         fmt_pref = (ctx.supplier_date_fmt or "DD/MM/YYYY").strip().upper()
         if first > 12:
-            return date(year, second, first)
+            return _dt.date(year, second, first)
         if second > 12:
-            return date(year, first, second)
+            return _dt.date(year, first, second)
         if fmt_pref == "MM/DD/YYYY":
-            return date(year, first, second)
-        return date(year, second, first)
+            return _dt.date(year, first, second)
+        return _dt.date(year, second, first)
 
-    return date(2026, 10, 12)
+    for fmt in ("%d-%b-%Y", "%Y/%m/%d", "%d-%m-%Y"):
+        try:
+            return _dt.datetime.strptime(val, fmt).date()
+        except ValueError:
+            continue
+
+    return _DEFAULT
 /
+
