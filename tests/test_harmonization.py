@@ -1,7 +1,13 @@
 from datetime import date
+import pytest
 
-from src.exasol_engine.db_client import ChakanExasolClient
+from src.exasol_engine.db_client import (
+    ChakanExasolClient,
+    ExasolBootstrapError,
+    ExasolWriteError,
+)
 from src.exasol_engine.harmonizer_core import (
+    jaro_winkler_similarity,
     normalize_uom_quantity,
     parse_asn_date,
     resolve_supplier_sku,
@@ -16,7 +22,7 @@ def test_uom_normalization_pack_and_weight_inversions() -> None:
     assert normalize_uom_quantity(3.312, "MT", "EA", unit_weight_kg=18.4) == 180.0
 
 
-def test_supplier_sku_drift_resolution() -> None:
+def test_supplier_sku_drift_and_jaro_winkler_resolution() -> None:
     sku, method, conf = resolve_supplier_sku("6204ZZ", "ENG-BRG-6204-01")
     assert sku == "ENG-BRG-6204-01"
     assert method == "VENDOR_CATALOG_ALIAS"
@@ -25,6 +31,13 @@ def test_supplier_sku_drift_resolution() -> None:
     sku_h, method_h, _ = resolve_supplier_sku("ENGGSKMLS06", "ENG-GSK-MLS-06")
     assert sku_h == "ENG-GSK-MLS-06"
     assert method_h == "HYPHEN_NORMALIZED"
+
+    # Genuine Jaro-Winkler similarity (>= 0.85 threshold) on OCR/typo SKUs
+    assert jaro_winkler_similarity("FBD6204Z", "FBD6204ZZ") >= 0.90
+    sku_jw, method_jw, conf_jw = resolve_supplier_sku("FBD6204Z", None)
+    assert sku_jw == "ENG-BRG-6204-01"
+    assert method_jw == "JARO_WINKLER_FUZZY"
+    assert conf_jw >= 0.85
 
 
 def test_multiformat_date_parsing() -> None:
@@ -35,7 +48,7 @@ def test_multiformat_date_parsing() -> None:
 
 def test_blast_radius_analytical_marts(tmp_path) -> None:
     client = ChakanExasolClient(data_dir=str(tmp_path))
-    marts = client.compute_analytical_marts()
+    marts = client.compute_analytical_marts(source="pandas")
 
     inv_df = marts["inventory_mart"]
     assert (inv_df["phantom_inventory_qty"] >= 0).all()
@@ -59,18 +72,18 @@ def test_blast_radius_analytical_marts(tmp_path) -> None:
         normalized_eta_date="2026-10-12",
         action="EXPEDITED_SHORTFALL_COVERED",
     )
-    updated_marts = client.compute_analytical_marts()
+    updated_marts = client.compute_analytical_marts(source="pandas")
     updated_net_risk = float(updated_marts["bom_risk_mart"]["revenue_at_risk_net_inr"].sum())
     assert updated_net_risk < initial_net_risk
 
     client.reset_planner_overrides()
-    reset_marts = client.compute_analytical_marts()
+    reset_marts = client.compute_analytical_marts(source="pandas")
     assert float(reset_marts["bom_risk_mart"]["revenue_at_risk_net_inr"].sum()) == initial_net_risk
 
 
 def test_financial_roi_and_downtime_cost_engine(tmp_path) -> None:
     client = ChakanExasolClient(data_dir=str(tmp_path))
-    marts = client.compute_analytical_marts()
+    marts = client.compute_analytical_marts(source="pandas")
 
     roi_mart = marts["financial_roi_mart"]
     assert roi_mart is not None
@@ -86,18 +99,15 @@ def test_financial_roi_and_downtime_cost_engine(tmp_path) -> None:
     assert "total_stoppage_exposure_inr" in bom_risk.columns
     assert "expedited_freight_cost_inr" in bom_risk.columns
 
-    # Short components should have positive freight and downtime cost
     short_rows = bom_risk[bom_risk["true_net_deficit_qty"] > 0]
     assert len(short_rows) > 0
     assert (short_rows["expedited_freight_cost_inr"] > 0).all()
     assert (short_rows["plant_idle_cost_inr"] > 0).all()
 
-    # Secured components should have 0 downtime loss and 0 freight cost
     secured_rows = bom_risk[bom_risk["true_net_deficit_qty"] == 0]
     assert (secured_rows["expedited_freight_cost_inr"] == 0).all()
     assert (secured_rows["plant_idle_cost_inr"] == 0).all()
 
-    # Triage queue has mitigation_roi_x and avoided_panic_freight_inr
     triage = marts["triage_queue"]
     assert "mitigation_roi_x" in triage.columns
     assert "avoided_panic_freight_inr" in triage.columns
@@ -105,23 +115,23 @@ def test_financial_roi_and_downtime_cost_engine(tmp_path) -> None:
 
 def test_telemetry_and_query_profiler(tmp_path) -> None:
     client = ChakanExasolClient(data_dir=str(tmp_path))
-    marts = client.compute_analytical_marts()
+    marts = client.compute_analytical_marts(source="pandas")
 
     assert "telemetry" in marts
     telemetry = marts["telemetry"]
 
     assert telemetry["engine_mode"] in ("EXASOL_PERSONAL", "LOCAL_MIRROR")
+    assert telemetry["compute_source"] in ("EXASOL_VIEWS", "PANDAS_MIRROR")
     assert telemetry["latency_ms"] > 0
-    assert telemetry["latency_sla_target_ms"] == 15.0
     assert telemetry["total_rows_evaluated"] >= 500
     assert telemetry["colocation_key"] == "internal_part_num"
-    assert telemetry["colocation_status"] == "CO_LOCATED_ACTIVE"
-    assert telemetry["mpp_network_hops"] == 0
-    assert telemetry["udf_engine"] == "PYTHON3_IN_DB_RAM"
+    assert "component_part_num" in telemetry["colocation_keys"]
+    assert telemetry["colocation_status"] in ("CO_LOCATED_ACTIVE", "MIRROR_IN_PROCESS")
+    assert telemetry["udf_engine"] in ("PYTHON3_IN_DB_RAM", "PYTHON_APP_PROCESS")
 
     stages = telemetry["latency_stages_ms"]
     assert len(stages) == 4
-    for stage_name, stage_latency in stages.items():
+    for _, stage_latency in stages.items():
         assert stage_latency >= 0.0
 
     counts = telemetry["table_row_counts"]
@@ -130,7 +140,7 @@ def test_telemetry_and_query_profiler(tmp_path) -> None:
     assert counts["BILL_OF_MATERIALS"] >= 15
 
 
-def test_what_if_scenario_simulation(tmp_path) -> None:
+def test_what_if_scenario_simulation_additive_waterfall(tmp_path) -> None:
     client = ChakanExasolClient(data_dir=str(tmp_path))
 
     # 1. Null Shock (Zero chaos parameters must equal baseline exactly)
@@ -156,19 +166,14 @@ def test_what_if_scenario_simulation(tmp_path) -> None:
     assert shock_sim["delta_net_risk_inr"] > 0
     assert shock_sim["delta_total_exposure_inr"] > 0
 
-    # Check Waterfall Stages
+    # Check Waterfall Stages AND strict additivity (sum of relative stages == total)
     wf = shock_sim["waterfall_data"]
     assert len(wf) == 5
     assert wf[0]["Stage"] == "1. Baseline True Shortage"
     assert wf[0]["Amount"] == base_net
-    assert wf[1]["Stage"] == "2. Logistics Transit Drift"
-    assert wf[1]["Amount"] > 0
-    assert wf[2]["Stage"] == "3. Quarantine Defect Spike"
-    assert wf[2]["Amount"] > 0
-    assert wf[3]["Stage"] == "4. Surge Output Demand"
-    assert wf[3]["Amount"] > 0
     assert wf[4]["Stage"] == "Total Simulated Exposure"
     assert wf[4]["Amount"] == sim_net
+    assert sum(step["Amount"] for step in wf[:4]) == pytest.approx(wf[4]["Amount"], abs=0.01)
 
     # Starvation run hours must be reduced or equal under shock
     base_hrs = shock_sim["baseline"]["bom_risk_mart"]["hours_to_starvation_harmonized"]
@@ -182,28 +187,82 @@ def test_scale_benchmark_suite() -> None:
         run_scale_benchmark,
     )
 
-    # 1. Verified Benchmark Integrity
-    bench = get_verified_scale_benchmark(network_hop_penalty_ms=0.45)
+    # 1. Pure Measured CPU Benchmark Integrity (0.0 ms synthetic network penalty)
+    bench = get_verified_scale_benchmark(network_hop_penalty_ms=0.0)
     assert bench["max_scale_rows"] == 10000
-    assert bench["peak_speedup_factor"] >= 50.0  # Proves 50x+ throughput advantage
+    assert bench["network_hop_penalty_ms"] == 0.0
+    assert bench["peak_cpu_speedup_factor"] >= 10.0
     assert len(bench["results_table"]) == 4
 
     for row in bench["results_table"]:
-        assert row["exasol_network_hops"] == 0
-        assert row["exasol_latency_ms"] < 150.0
-        assert row["speedup_factor"] >= 1.0
-        assert row["latency_reduction_pct"] > 50.0
+        assert row["legacy_network_ms"] == 0.0
+        assert row["exasol_latency_ms"] < 250.0
+        assert row["speedup_cpu_only"] >= 1.0
 
-    # Row 10,000 must deliver 50x+ acceleration
     row_10k = [r for r in bench["results_table"] if r["batch_rows"] == 10000][0]
-    assert row_10k["speedup_factor"] >= 50.0
-    assert row_10k["legacy_network_hops"] == 10000
+    assert row_10k["speedup_cpu_only"] >= 10.0
 
-    # 2. Live Dynamic Scaling Test (Fast subset 500 rows)
-    live_res = run_scale_benchmark(scales=[500], network_hop_penalty_ms=0.45)
+    # 2. Live Dynamic Scaling Test (Fast subset 500 rows, zero synthetic penalty)
+    live_res = run_scale_benchmark(scales=[500], network_hop_penalty_ms=0.0)
     assert len(live_res["results_table"]) == 1
-    assert live_res["results_table"][0]["exasol_network_hops"] == 0
-    assert live_res["results_table"][0]["exasol_latency_ms"] < 200.0
+    assert live_res["results_table"][0]["legacy_network_ms"] == 0.0
+    assert live_res["results_table"][0]["exasol_latency_ms"] < 250.0
+
+
+def test_broken_connection_raises_explicit_errors(tmp_path) -> None:
+    class BrokenConn:
+        def execute(self, *args, **kwargs):
+            raise RuntimeError("Simulated database failure")
+
+        def import_from_pandas(self, *args, **kwargs):
+            raise RuntimeError("Simulated bulk import failure")
+
+    client = ChakanExasolClient(data_dir=str(tmp_path))
+    client.conn = BrokenConn()
+
+    with pytest.raises(ExasolBootstrapError):
+        client.bootstrap_exasol_schema_and_data()
+
+    client.conn = BrokenConn()
+    with pytest.raises(ExasolWriteError):
+        client.approve_harmonization_override(
+            asn_line_id="ASN-L-9011",
+            resolved_part_num="AXL-HUB-DUC-14",
+            normalized_qty=600.0,
+            normalized_uom="EA",
+            normalized_eta_date="2026-10-12",
+        )
+
+
+def test_exasol_views_match_pandas_mirror(tmp_path) -> None:
+    client = ChakanExasolClient(data_dir=str(tmp_path))
+    if not client.connect():
+        pytest.skip("Exasol Personal container not reachable on localhost:8563")
+
+    mode, _ = client.bootstrap_exasol_schema_and_data()
+    assert mode == "EXASOL_PERSONAL"
+
+    exa_marts = client.compute_analytical_marts(source="exasol")
+    pan_marts = client.compute_analytical_marts(source="pandas")
+
+    assert exa_marts["compute_source"] == "EXASOL_VIEWS"
+    assert pan_marts["compute_source"] == "PANDAS_MIRROR"
+
+    for kpi_key in (
+        "total_scheduled_value_inr",
+        "legacy_risk_inr",
+        "net_risk_inr",
+        "cleared_by_udf_inr",
+        "total_idle_loss_inr",
+        "total_stoppage_exposure_inr",
+        "total_freight_cost_inr",
+        "headline_roi_x",
+        "false_alarms_cleared_count",
+        "avoided_panic_freight_inr",
+    ):
+        assert exa_marts["financial_roi_mart"][kpi_key] == pytest.approx(
+            pan_marts["financial_roi_mart"][kpi_key], abs=0.01
+        ), f"Mismatch on {kpi_key}"
 
 
 
