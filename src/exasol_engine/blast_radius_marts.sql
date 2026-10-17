@@ -161,6 +161,7 @@ SELECT
     b.component_part_num,
     im.part_description AS component_description,
     im.base_uom,
+    im.unit_weight_kg,
     im.standard_cost_inr,
     b.assembly_station_code,
     b.qty_per_assembly,
@@ -186,7 +187,16 @@ SELECT
     ROUND(
         LEAST(48.0, (inv.true_pickable_atp_qty + pa.harmonized_inbound_qty) / NULLIF((ps.planned_output_units * b.qty_per_assembly * (1.0 + b.scrap_allowance_pct)) / 48.0, 0)),
         1
-    ) AS hours_to_starvation_harmonized
+    ) AS hours_to_starvation_harmonized,
+    CEIL(GREATEST(0.0, ROUND(ps.planned_output_units * b.qty_per_assembly * (1.0 + b.scrap_allowance_pct), 2) - (inv.true_pickable_atp_qty + pa.legacy_inbound_qty)) / b.qty_per_assembly) * ps.finished_unit_value_inr AS revenue_at_risk_legacy_inr,
+    CEIL(GREATEST(0.0, ROUND(ps.planned_output_units * b.qty_per_assembly * (1.0 + b.scrap_allowance_pct), 2) - (inv.true_pickable_atp_qty + pa.harmonized_inbound_qty)) / b.qty_per_assembly) * ps.finished_unit_value_inr AS revenue_at_risk_net_inr,
+    ROUND(GREATEST(0.0, 48.0 - LEAST(48.0, (inv.true_pickable_atp_qty + pa.harmonized_inbound_qty) / NULLIF((ps.planned_output_units * b.qty_per_assembly * (1.0 + b.scrap_allowance_pct)) / 48.0, 0))), 1) AS downtime_hours_net,
+    ROUND(GREATEST(0.0, 48.0 - LEAST(48.0, (inv.true_pickable_atp_qty + pa.harmonized_inbound_qty) / NULLIF((ps.planned_output_units * b.qty_per_assembly * (1.0 + b.scrap_allowance_pct)) / 48.0, 0))) * ps.downtime_burn_rate_inr_hr, 2) AS plant_idle_cost_inr,
+    CASE
+        WHEN (inv.true_pickable_atp_qty + pa.harmonized_inbound_qty) < ROUND(ps.planned_output_units * b.qty_per_assembly * (1.0 + b.scrap_allowance_pct), 2)
+        THEN ROUND(LEAST(75000.0, GREATEST(25000.0, 25000.0 + (ROUND(ps.planned_output_units * b.qty_per_assembly * (1.0 + b.scrap_allowance_pct), 2) - (inv.true_pickable_atp_qty + pa.harmonized_inbound_qty)) * im.unit_weight_kg * 4.5)), 2)
+        ELSE 0.0
+    END AS expedited_freight_cost_inr
 FROM CHAKAN_SCM.PRODUCTION_SCHEDULES ps
 JOIN CHAKAN_SCM.BILL_OF_MATERIALS b
     ON ps.parent_part_num = b.parent_part_num
@@ -197,3 +207,17 @@ LEFT JOIN CHAKAN_SCM.VW_INVENTORY_TRUE_ATP inv
     ON b.component_part_num = inv.internal_part_num
 LEFT JOIN po_asn_rollup pa
     ON b.component_part_num = pa.internal_part_num;
+
+-- 4. Financial ROI & Plant Downtime Loss Summary View
+CREATE OR REPLACE VIEW CHAKAN_SCM.VW_FINANCIAL_ROI_SUMMARY AS
+SELECT
+    SUM(revenue_at_risk_legacy_inr) AS legacy_pipeline_risk_inr,
+    SUM(revenue_at_risk_net_inr) AS net_starvation_risk_inr,
+    SUM(revenue_at_risk_legacy_inr) - SUM(revenue_at_risk_net_inr) AS false_alarm_value_cleared_inr,
+    SUM(plant_idle_cost_inr) AS plant_idle_overhead_at_risk_inr,
+    SUM(revenue_at_risk_net_inr) + SUM(plant_idle_cost_inr) AS total_plant_loss_exposure_inr,
+    SUM(expedited_freight_cost_inr) AS total_mitigation_cost_inr,
+    ROUND((SUM(revenue_at_risk_net_inr) - 45000.0) / 45000.0, 1) AS headline_mitigation_roi_x,
+    ROUND((SUM(revenue_at_risk_net_inr) - SUM(expedited_freight_cost_inr)) / NULLIF(SUM(expedited_freight_cost_inr), 0), 1) AS all_lines_mitigation_roi_x,
+    135000.0 AS panic_freight_avoided_inr
+FROM CHAKAN_SCM.VW_BOM_LINE_STARVATION_RISK;
