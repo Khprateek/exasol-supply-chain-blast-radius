@@ -37,17 +37,20 @@ def render_sidebar(client: ChakanExasolClient, marts: dict) -> None:
     st.sidebar.markdown("### Exasol Platform Control")
     st.sidebar.caption("Schema: `CHAKAN_SCM` | DSN: `localhost:8563`")
 
+    telemetry = marts.get("telemetry", {})
+    compute_source = marts.get("compute_source", telemetry.get("compute_source", "PANDAS_MIRROR"))
     mode_label = (
-        "EXASOL PERSONAL (LIVE MPP)"
+        "EXASOL PERSONAL (LIVE SQL/UDF)"
         if marts["engine_mode"] == "EXASOL_PERSONAL"
         else "LOCAL ANALYTICAL MIRROR"
     )
     st.sidebar.metric("Execution Engine", mode_label)
+    st.sidebar.metric("Compute Source", compute_source)
     st.sidebar.metric("Analytical Mart Latency", f"{marts['query_latency_ms']:.2f} ms")
-    total_eval = marts.get("telemetry", {}).get("total_rows_evaluated", len(marts["asn_lineage_mart"]))
-    st.sidebar.metric("In-DB Rows in RAM", f"{total_eval:,} Records")
-    st.sidebar.metric("Co-Location Partitioning", "DISTRIBUTE BY (item_id)")
-    st.sidebar.caption("Inter-Node Network Redistribution: **0 Net Hops**")
+    total_eval = telemetry.get("total_rows_evaluated", len(marts["asn_lineage_mart"]))
+    st.sidebar.metric("Rows Evaluated", f"{total_eval:,} Records")
+    st.sidebar.metric("Distribution Keys", "internal_part_num / component_part_num")
+    st.sidebar.caption("Co-located joins across `ITEM_MASTER`, `PURCHASE_ORDER_LINES`, `WAREHOUSE_INVENTORY_LEDGER`, `BILL_OF_MATERIALS`")
 
     st.sidebar.markdown("---")
     st.sidebar.markdown("### Live Demo Workflow")
@@ -78,68 +81,72 @@ def render_sidebar(client: ChakanExasolClient, marts: dict) -> None:
 def render_telemetry_banner(marts: dict) -> None:
     telemetry = marts.get("telemetry", {})
     engine_mode = marts.get("engine_mode", "LOCAL_MIRROR")
-    latency_ms = marts.get("query_latency_ms", 12.4)
-    total_rows = telemetry.get("total_rows_evaluated", len(marts.get("asn_lineage_mart", [])))
+    compute_source = marts.get("compute_source", telemetry.get("compute_source", "PANDAS_MIRROR"))
+    latency_ms = float(marts.get("query_latency_ms", telemetry.get("latency_ms", 0.0)))
+    total_rows = int(telemetry.get("total_rows_evaluated", len(marts.get("asn_lineage_mart", []))))
     colocation_key = telemetry.get("colocation_key", "internal_part_num")
+    udf_engine = telemetry.get("udf_engine", "PYTHON3_IN_DB_RAM")
 
-    is_live = (engine_mode == "EXASOL_PERSONAL")
+    is_live = (engine_mode == "EXASOL_PERSONAL" and compute_source == "EXASOL_VIEWS")
     mode_html = (
-        '<span style="background-color: #064e3b; color: #34d399; padding: 4px 10px; border-radius: 6px; font-weight: 700; font-size: 0.82rem; border: 1px solid #059669;">🟢 EXASOL PERSONAL (LIVE MPP)</span>'
+        '<span style="background-color: #064e3b; color: #34d399; padding: 4px 10px; border-radius: 6px; font-weight: 700; font-size: 0.82rem; border: 1px solid #059669;">🟢 EXASOL PERSONAL (LIVE SQL VIEWS &amp; UDFs)</span>'
         if is_live
-        else '<span style="background-color: #451a03; color: #fde68a; padding: 4px 10px; border-radius: 6px; font-weight: 700; font-size: 0.82rem; border: 1px solid #d97706;">🟠 LOCAL ANALYTICAL MIRROR (EXASOL PARITY)</span>'
+        else '<span style="background-color: #451a03; color: #fde68a; padding: 4px 10px; border-radius: 6px; font-weight: 700; font-size: 0.82rem; border: 1px solid #d97706;">🟠 LOCAL ANALYTICAL MIRROR (PANDAS FALLBACK)</span>'
     )
 
     st.markdown(
         f"""
         <div style="display: flex; flex-wrap: wrap; gap: 8px; align-items: center; background-color: #0b1120; padding: 8px 14px; border-radius: 8px; margin-top: 6px; margin-bottom: 12px; border: 1px solid #1e293b;">
-            <span style="font-size: 0.76rem; font-weight: 800; color: #94a3b8; text-transform: uppercase; letter-spacing: 0.5px;">LIVE EXASOL TELEMETRY:</span>
+            <span style="font-size: 0.76rem; font-weight: 800; color: #94a3b8; text-transform: uppercase; letter-spacing: 0.5px;">LIVE ENGINE TELEMETRY:</span>
             {mode_html}
-            <span style="background-color: #1e1b4b; color: #a5b4fc; padding: 4px 10px; border-radius: 6px; font-weight: 700; font-size: 0.82rem; border: 1px solid #4f46e5;">⚡ Latency: {latency_ms:.1f} ms (&lt;15ms Target)</span>
-            <span style="background-color: #1f2937; color: #e5e7eb; padding: 4px 10px; border-radius: 6px; font-weight: 600; font-size: 0.82rem; border: 1px solid #374151;">💾 {total_rows:,} Rows Evaluated in RAM</span>
-            <span style="background-color: #0c4a6e; color: #7dd3fc; padding: 4px 10px; border-radius: 6px; font-weight: 600; font-size: 0.82rem; border: 1px solid #0284c7;">🔗 DISTRIBUTE BY ({colocation_key}) [0 Net Hops]</span>
-            <span style="background-color: #3b0764; color: #f0abfc; padding: 4px 10px; border-radius: 6px; font-weight: 600; font-size: 0.82rem; border: 1px solid #9333ea;">🐍 In-DB Python 3 UDF Engine</span>
+            <span style="background-color: #1e1b4b; color: #a5b4fc; padding: 4px 10px; border-radius: 6px; font-weight: 700; font-size: 0.82rem; border: 1px solid #4f46e5;">⚡ Measured Latency: {latency_ms:.1f} ms ({compute_source})</span>
+            <span style="background-color: #1f2937; color: #e5e7eb; padding: 4px 10px; border-radius: 6px; font-weight: 600; font-size: 0.82rem; border: 1px solid #374151;">💾 {total_rows:,} Rows Evaluated</span>
+            <span style="background-color: #0c4a6e; color: #7dd3fc; padding: 4px 10px; border-radius: 6px; font-weight: 600; font-size: 0.82rem; border: 1px solid #0284c7;">🔗 DISTRIBUTE BY ({colocation_key})</span>
+            <span style="background-color: #3b0764; color: #f0abfc; padding: 4px 10px; border-radius: 6px; font-weight: 600; font-size: 0.82rem; border: 1px solid #9333ea;">🐍 UDF Engine: {udf_engine}</span>
         </div>
         """,
         unsafe_allow_html=True,
     )
 
-    with st.expander("🔍 Live Exasol In-Memory Query Profiler & MPP Co-Location Plan (Click to inspect pipeline)", expanded=False):
+    with st.expander("🔍 Live Query Stage Timings & Schema Distribution Plan (Click to inspect pipeline)", expanded=False):
         stages = telemetry.get("latency_stages_ms", {})
+        s1_ms = stages.get("view_inventory_true_atp", stages.get("inventory_mart", 0.0))
+        s2_ms = stages.get("view_asn_harmonized_lineage", stages.get("asn_harmonization", 0.0))
+        s3_ms = stages.get("view_bom_line_starvation_risk", stages.get("bom_risk_mart", 0.0))
+        s4_ms = stages.get("python_triage_postprocess", stages.get("triage_and_roi", 0.0))
+
         c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Stage 1: Columnar Ingest & Dedup", f"{stages.get('raw_scan_and_dedup', 2.0):.1f} ms", "Hot In-Memory Scan")
-        c2.metric("Stage 2: In-DB Python 3 UDFs", f"{stages.get('in_db_udf_harmonization', 5.5):.1f} ms", "SKU / UOM / Date Parser")
-        c3.metric("Stage 3: Co-Located Hash Join", f"{stages.get('colocated_bom_join', 2.9):.1f} ms", "DISTRIBUTE BY (Zero Hops)")
-        c4.metric("Stage 4: Blast-Radius & ROI Mart", f"{stages.get('blast_radius_aggregation', 1.8):.1f} ms", "Analytical Materialization")
+        c1.metric("Stage 1: True ATP Mart", f"{s1_ms:.2f} ms", "VW_INVENTORY_TRUE_ATP")
+        c2.metric("Stage 2: ASN UDF Lineage", f"{s2_ms:.2f} ms", "VW_ASN_HARMONIZED_LINEAGE")
+        c3.metric("Stage 3: BOM Starvation Risk", f"{s3_ms:.2f} ms", "VW_BOM_LINE_STARVATION_RISK")
+        c4.metric("Stage 4: Triage & ROI Rollup", f"{s4_ms:.2f} ms", "Triage Ranking & ROI")
 
         st.markdown("---")
         col_prof1, col_prof2 = st.columns([1, 1])
         with col_prof1:
-            st.markdown("**MPP Co-Location Partitioning Strategy (Why Joins Run in < 15ms):**")
+            st.markdown("**Schema Distribution Strategy (`ddl_schema.sql`):**")
             st.markdown(
                 """
-                In traditional MPP engines, multi-table joins require massive network redistribution (shuffling) across nodes.
-                Exasol eliminates network bottlenecks by physically co-locating matching partition slices using distribution keys:
-                - `ITEM_MASTER`: Distributed on `internal_part_num`
-                - `BILL_OF_MATERIALS`: Distributed on `component_part_num`
-                - `PURCHASE_ORDER_LINES`: Distributed on `internal_part_num`
-                - `WAREHOUSE_INVENTORY_LEDGER`: Distributed on `internal_part_num`
-                - `PRODUCTION_SCHEDULES`: Distributed on `parent_part_num`
-                
-                Because matching keys reside on the same memory slice, **Exasol executes local in-memory hash joins with 0 inter-node network hops**.
+                Tables in `CHAKAN_SCM` are partitioned on their primary join keys so part-level joins align across slices:
+                - `ITEM_MASTER`, `PURCHASE_ORDER_LINES`, `WAREHOUSE_INVENTORY_LEDGER`: `DISTRIBUTE BY (internal_part_num)`
+                - `BILL_OF_MATERIALS`: `DISTRIBUTE BY (component_part_num)` (joins to `ITEM_MASTER.internal_part_num`)
+                - `PRODUCTION_SCHEDULES`: `DISTRIBUTE BY (parent_part_num)`
+                - `ASN_LINES_RAW`, `ASN_PLANNER_OVERRIDES`: `DISTRIBUTE BY (po_number_ref)` / `(asn_line_id)`
                 """
             )
         with col_prof2:
-            st.markdown("**Live Table Memory Footprint:**")
+            st.markdown("**Live Table Row Counts:**")
             counts = telemetry.get("table_row_counts", {})
             prof_table = pd.DataFrame(
                 [
-                    {"Table Name": "ASN_LINES_RAW", "Partition Key": "po_number_ref", "Storage": "Columnar RAM", "Rows": f"{counts.get('ASN_LINES_RAW', 0):,}"},
-                    {"Table Name": "PURCHASE_ORDER_LINES", "Partition Key": "internal_part_num", "Storage": "Columnar RAM", "Rows": f"{counts.get('PURCHASE_ORDER_LINES', 0):,}"},
-                    {"Table Name": "ITEM_MASTER", "Partition Key": "internal_part_num", "Storage": "Columnar RAM", "Rows": f"{counts.get('ITEM_MASTER', 0):,}"},
-                    {"Table Name": "BILL_OF_MATERIALS", "Partition Key": "component_part_num", "Storage": "Columnar RAM", "Rows": f"{counts.get('BILL_OF_MATERIALS', 0):,}"},
-                    {"Table Name": "WAREHOUSE_INVENTORY_LEDGER", "Partition Key": "internal_part_num", "Storage": "Columnar RAM", "Rows": f"{counts.get('WAREHOUSE_INVENTORY_LEDGER', 0):,}"},
-                    {"Table Name": "PRODUCTION_SCHEDULES", "Partition Key": "parent_part_num", "Storage": "Columnar RAM", "Rows": f"{counts.get('PRODUCTION_SCHEDULES', 0):,}"},
-                    {"Table Name": "SUPPLIER_MASTER", "Partition Key": "supplier_id (PK)", "Storage": "Replicated / Local", "Rows": f"{counts.get('SUPPLIER_MASTER', 0):,}"},
+                    {"Table Name": "ASN_LINES_RAW", "Distribution Key": "po_number_ref", "Storage": "Columnar RAM", "Rows": f"{counts.get('ASN_LINES_RAW', 0):,}"},
+                    {"Table Name": "PURCHASE_ORDER_LINES", "Distribution Key": "internal_part_num", "Storage": "Columnar RAM", "Rows": f"{counts.get('PURCHASE_ORDER_LINES', 0):,}"},
+                    {"Table Name": "ITEM_MASTER", "Distribution Key": "internal_part_num", "Storage": "Columnar RAM", "Rows": f"{counts.get('ITEM_MASTER', 0):,}"},
+                    {"Table Name": "BILL_OF_MATERIALS", "Distribution Key": "component_part_num", "Storage": "Columnar RAM", "Rows": f"{counts.get('BILL_OF_MATERIALS', 0):,}"},
+                    {"Table Name": "WAREHOUSE_INVENTORY_LEDGER", "Distribution Key": "internal_part_num", "Storage": "Columnar RAM", "Rows": f"{counts.get('WAREHOUSE_INVENTORY_LEDGER', 0):,}"},
+                    {"Table Name": "PRODUCTION_SCHEDULES", "Distribution Key": "parent_part_num", "Storage": "Columnar RAM", "Rows": f"{counts.get('PRODUCTION_SCHEDULES', 0):,}"},
+                    {"Table Name": "SUPPLIER_MASTER", "Distribution Key": "supplier_id (PK)", "Storage": "Columnar RAM", "Rows": f"{counts.get('SUPPLIER_MASTER', 0):,}"},
+                    {"Table Name": "ASN_PLANNER_OVERRIDES", "Distribution Key": "asn_line_id", "Storage": "Columnar RAM", "Rows": f"{counts.get('ASN_PLANNER_OVERRIDES', 0):,}"},
                 ]
             )
             st.dataframe(prof_table, use_container_width=True, hide_index=True)
@@ -488,7 +495,10 @@ def render_scenario_simulator_tab(client: ChakanExasolClient, marts: dict) -> No
     delta_short = sim_short_count - base_short_count
 
     is_chaos_active = (sim_delay > 0 or sim_quar > 0 or sim_surge > 1.00)
-    recalc_latency = sim_marts["query_latency_ms"]
+    recalc_latency = float(sim_marts["query_latency_ms"])
+    sim_total_rows = int(sim_marts.get("telemetry", {}).get("total_rows_evaluated", len(sim_marts["asn_lineage_mart"])))
+    base_net_val = float(base_roi["net_risk_inr"])
+    base_exp_val = float(base_roi["total_stoppage_exposure_inr"])
 
     status_tag = (
         f'<span style="background-color: #7f1d1d; color: #fca5a5; padding: 4px 10px; border-radius: 6px; font-weight: 700; font-size: 0.82rem; border: 1px solid #dc2626;">🔴 CHAOS SIMULATION ACTIVE (+{sim_delay}d delay, {sim_quar}% defect, {sim_surge:.2f}x surge)</span>'
@@ -501,9 +511,9 @@ def render_scenario_simulator_tab(client: ChakanExasolClient, marts: dict) -> No
         <div style="display: flex; flex-wrap: wrap; gap: 8px; align-items: center; background-color: #0f172a; padding: 8px 14px; border-radius: 8px; margin-top: 4px; margin-bottom: 12px; border: 1px solid #334155;">
             <span style="font-size: 0.76rem; font-weight: 800; color: #94a3b8; text-transform: uppercase;">SIMULATOR STATUS:</span>
             {status_tag}
-            <span style="background-color: #1e1b4b; color: #a5b4fc; padding: 4px 10px; border-radius: 6px; font-weight: 700; font-size: 0.82rem; border: 1px solid #4f46e5;">⚡ In-DB Recalculation: {recalc_latency:.1f} ms (&lt;15ms SLA)</span>
-            <span style="background-color: #1f2937; color: #e5e7eb; padding: 4px 10px; border-radius: 6px; font-weight: 600; font-size: 0.82rem; border: 1px solid #374151;">💾 589 Rows Evaluated in Memory</span>
-            <span style="background-color: #0c4a6e; color: #7dd3fc; padding: 4px 10px; border-radius: 6px; font-weight: 600; font-size: 0.82rem; border: 1px solid #0284c7;">🔗 0 Network Shuffles</span>
+            <span style="background-color: #1e1b4b; color: #a5b4fc; padding: 4px 10px; border-radius: 6px; font-weight: 700; font-size: 0.82rem; border: 1px solid #4f46e5;">⚡ Recalculation Latency: {recalc_latency:.1f} ms</span>
+            <span style="background-color: #1f2937; color: #e5e7eb; padding: 4px 10px; border-radius: 6px; font-weight: 600; font-size: 0.82rem; border: 1px solid #374151;">💾 {sim_total_rows:,} Rows Evaluated</span>
+            <span style="background-color: #0c4a6e; color: #7dd3fc; padding: 4px 10px; border-radius: 6px; font-weight: 600; font-size: 0.82rem; border: 1px solid #0284c7;">📐 Sequential Additive Attribution</span>
         </div>
         """,
         unsafe_allow_html=True,
@@ -514,25 +524,25 @@ def render_scenario_simulator_tab(client: ChakanExasolClient, marts: dict) -> No
     m1.metric(
         "Simulated Revenue at Risk",
         format_inr_crore_lakh(sim_net),
-        f"+{format_inr_crore_lakh(delta_net)} Escalation" if delta_net > 0 else "Baseline (Rs 5.29 Cr)",
+        f"+{format_inr_crore_lakh(delta_net)} Escalation" if delta_net > 0 else f"Baseline ({format_inr_crore_lakh(base_net_val)})",
         delta_color="inverse",
     )
     m2.metric(
         "Total Inaction Exposure",
         format_inr_crore_lakh(sim_exp),
-        f"+{format_inr_crore_lakh(delta_exp)} Downtime Loss" if delta_exp > 0 else "Baseline (Rs 7.92 Cr)",
+        f"+{format_inr_crore_lakh(delta_exp)} Downtime Loss" if delta_exp > 0 else f"Baseline ({format_inr_crore_lakh(base_exp_val)})",
         delta_color="inverse",
     )
     m3.metric(
         "Earliest Assembly Line Halt",
         f"{sim_min_hrs:.1f} Hours",
-        f"{delta_hrs:+.1f} Hours Shift" if delta_hrs != 0 else "Baseline (8.6 hrs)",
+        f"{delta_hrs:+.1f} Hours Shift" if delta_hrs != 0 else f"Baseline ({base_min_hrs:.1f} hrs)",
         delta_color="inverse",
     )
     m4.metric(
         "Starving Component SKUs",
         f"{sim_short_count} of {len(sim_bom)} SKUs",
-        f"+{delta_short} Newly Starving SKUs" if delta_short > 0 else "Baseline (1 SKU)",
+        f"+{delta_short} Newly Starving SKUs" if delta_short > 0 else f"Baseline ({base_short_count} SKU{'s' if base_short_count != 1 else ''})",
         delta_color="inverse",
     )
 
@@ -663,39 +673,37 @@ def render_scale_benchmark_tab(client: ChakanExasolClient, marts: dict) -> None:
         run_scale_benchmark,
     )
 
-    st.subheader("High-Scale Stress Benchmark: In-Memory Columnar MPP vs. Row-by-Row ETL")
+    st.subheader("High-Scale Stress Benchmark: Set-Based Columnar Pipeline vs. Row-by-Row ETL")
     st.caption(
-        "In high-volume automotive plants (Tata Motors, Bajaj Auto in Pune-Chakan), inbound supplier ASN dispatches "
+        "In high-volume automotive powertrain plants in the Pune-Chakan industrial corridor, inbound supplier ASN dispatches "
         "spike from 500 records on normal shifts to 10,000+ dispatches during weekend supplier reconciliations. "
-        "Traditional row-by-row ETL systems collapse under unpartitioned join overhead, while Exasol's in-memory "
-        "columnar engine with co-located partitioning maintains sub-second execution speeds."
+        "By default, this benchmark reports pure measured CPU wall-clock times (0.0 ms synthetic overhead) comparing "
+        "set-based columnar execution against uncached row-by-row Python ETL (`iterrows()`)."
     )
 
     # 1. Benchmark Execution Configuration Controls
     col_c1, col_c2 = st.columns([2, 1])
     with col_c1:
         sim_penalty = st.checkbox(
-            "Include Distributed Network Hop Overhead (0.45 ms / unpartitioned row lookup in legacy multi-node clusters)",
-            value=st.session_state.get("bench_include_penalty", True),
-            help="Unpartitioned multi-node ETL clusters (Airflow/Spark/Informatica without co-location) incur network serialization RPC overhead for cross-node joins. Exasol co-locates matching keys in memory with 0 hops.",
+            "Optional: Add Modeled Multi-Node RPC Hop Overhead (+0.45 ms/row) on top of measured CPU time",
+            value=st.session_state.get("bench_include_penalty", False),
+            help="When unchecked (default), 100% of numbers are real measured CPU wall-clock timings. Checking this adds a modeled 0.45 ms/row network RPC penalty to illustrate unpartitioned remote lookups.",
             key="cb_bench_penalty",
         )
         st.session_state["bench_include_penalty"] = sim_penalty
 
     with col_c2:
         penalty_val = 0.45 if sim_penalty else 0.0
-        run_live = st.button("⚡ Run Live In-DB Scale Benchmark (500 to 10k Rows)", use_container_width=True)
+        run_live = st.button("⚡ Run Live Scale Benchmark (500 to 10k Rows)", use_container_width=True)
 
     if run_live:
-        with st.spinner("Executing live multi-tier benchmark across 500, 2,500, 5,000, and 10,000 rows in Exasol memory..."):
+        with st.spinner("Executing live multi-tier benchmark across 500, 2,500, 5,000, and 10,000 rows..."):
             bench_results = run_scale_benchmark(
                 scales=[500, 2500, 5000, 10000],
                 network_hop_penalty_ms=penalty_val,
                 client=client,
             )
             st.session_state["live_bench_results"] = bench_results
-    elif "live_bench_results" in st.session_state:
-        bench_results = st.session_state["live_bench_results"]
     else:
         bench_results = get_verified_scale_benchmark(network_hop_penalty_ms=penalty_val)
 
@@ -1046,7 +1054,7 @@ def render_financial_roi_tab(client: ChakanExasolClient, marts: dict) -> None:
             "Apparent Legacy Threat": cleared_asns["revenue_at_risk_legacy_inr"].apply(format_inr_crore_lakh),
             "Outcome": cleared_asns["operational_verdict"],
             "Avoided Panic Freight": cleared_asns["avoided_panic_freight_inr"].apply(
-                lambda v: "Rs 45,000 Saved" if v > 0 else "Buffer Protected"
+                lambda v: f"Rs {v:,.0f} Saved" if v > 0 else "Buffer Protected"
             ),
         }
     )
@@ -1098,9 +1106,9 @@ def render_exasol_engine_tab(client: ChakanExasolClient, marts: dict) -> None:
     st.markdown(
         """
         This solution uses **Exasol Personal** (`CHAKAN_SCM` schema) as the core analytical and data-harmonization platform:
-        - **MPP Co-Located Joins (`DISTRIBUTE BY`):** `ITEM_MASTER`, `BILL_OF_MATERIALS`, `PURCHASE_ORDER_LINES`, and `WAREHOUSE_INVENTORY_LEDGER` are distributed on `internal_part_num` so joins execute locally without network redistribution.
+        - **Schema Distribution (`DISTRIBUTE BY`):** `ITEM_MASTER`, `PURCHASE_ORDER_LINES`, and `WAREHOUSE_INVENTORY_LEDGER` distribute on `internal_part_num`; `BILL_OF_MATERIALS` distributes on `component_part_num` so part-level joins align.
         - **In-Database Python 3 Scalar UDFs:** `UDF_NORMALIZE_UOM`, `UDF_RESOLVE_SUPPLIER_SKU`, and `UDF_PARSE_ASN_DATE` run inside Exasol next to the columnar tables.
-        - **Interactive Writeback Loop:** Planner overrides persist directly to `CHAKAN_SCM.ASN_PLANNER_OVERRIDES` and trigger sub-second view recalculation.
+        - **Interactive Writeback Loop:** Planner overrides persist directly to `CHAKAN_SCM.ASN_PLANNER_OVERRIDES` and trigger immediate view recalculation.
         """
     )
 
@@ -1110,7 +1118,7 @@ def render_exasol_engine_tab(client: ChakanExasolClient, marts: dict) -> None:
             "1. MPP Schema DDL (ddl_schema.sql)",
             "2. Python 3 UDFs (udfs_harmonization.sql)",
             "3. Analytical Views (blast_radius_marts.sql)",
-            "4. Live Query Profiler & EXPLAIN Plan",
+            "4. Live Query Profiler & Execution Pipeline",
         ]
     )
     with t_ddl:
@@ -1121,39 +1129,41 @@ def render_exasol_engine_tab(client: ChakanExasolClient, marts: dict) -> None:
         st.code((sql_dir / "blast_radius_marts.sql").read_text(encoding="utf-8"), language="sql")
     with t_prof:
         telemetry = marts.get("telemetry", {})
-        st.markdown("### Native Exasol Query Execution Profiler")
-        st.caption("Sub-second in-memory query execution path with co-located MPP hash joins.")
+        measured_ms = float(marts.get("query_latency_ms", 0.0))
+        compute_src = marts.get("compute_source", telemetry.get("compute_source", "PANDAS_MIRROR"))
+        asn_rows = int(telemetry.get("total_asns", 498))
+        st.markdown("### Native Exasol Query Execution Pipeline")
+        st.caption(f"Live compute source: `{compute_src}` | Measured round-trip latency: `{measured_ms:.2f} ms`")
 
         st.code(
-            """-- NATIVE EXASOL IN-MEMORY EXECUTION PLAN (VW_BOM_LINE_STARVATION_RISK)
+            f"""-- LOGICAL EXECUTION PIPELINE (VW_BOM_LINE_STARVATION_RISK)
 ----------------------------------------------------------------------------------------------------------------
-STAGE 1: HOT IN-MEMORY COLUMNAR SCAN
-  -> SCAN CHAKAN_SCM.ASN_LINES_RAW (498 records)
+STAGE 1: IN-MEMORY COLUMNAR SCAN & DEDUPLICATION
+  -> SCAN CHAKAN_SCM.ASN_LINES_RAW ({asn_rows} records)
   -> ROW_NUMBER() OVER (PARTITION BY asn_number, po_number_ref, raw_supplier_sku, raw_shipped_qty)
   -> DEDUPLICATION FILTER (transmission_seq = 1)
 
-STAGE 2: IN-DATABASE PYTHON 3 SCALAR SCRIPT EXECUTION (PARALLEL WORKER CORES)
+STAGE 2: IN-DATABASE PYTHON 3 SCALAR SCRIPT EXECUTION
   -> EXECUTE SCALAR PYTHON UDF: CHAKAN_SCM.UDF_RESOLVE_SUPPLIER_SKU(raw_supplier_sku, po_part_num)
-     [Jaro-Winkler Metric + Hyphen Normalization + Vendor Alias Catalog]
+     [Exact / Hyphen-Normalized / Vendor Alias Catalog / Token / Jaro-Winkler >= 0.85]
   -> EXECUTE SCALAR PYTHON UDF: CHAKAN_SCM.UDF_NORMALIZE_UOM(raw_shipped_qty, raw_shipped_uom, base_uom, pack_size, unit_wt)
      [Standard Pack Multiplication + Weight-to-Count Conversions]
   -> EXECUTE SCALAR PYTHON UDF: CHAKAN_SCM.UDF_PARSE_ASN_DATE(raw_eta_date, default_date_format)
 
-STAGE 3: CO-LOCATED IN-MEMORY MPP HASH JOIN (0 INTER-NODE NETWORK REDISTRIBUTION)
-  -> JOIN CHAKAN_SCM.ITEM_MASTER ON (internal_part_num) [MATCHING SLICE]
-  -> JOIN CHAKAN_SCM.BILL_OF_MATERIALS ON (component_part_num) [MATCHING SLICE]
-  -> JOIN CHAKAN_SCM.PRODUCTION_SCHEDULES ON (parent_part_num) [MATCHING SLICE]
-  -> LEFT JOIN CHAKAN_SCM.WAREHOUSE_INVENTORY_LEDGER ON (internal_part_num) [MATCHING SLICE]
-  ** NETWORK HOP PENALTY: 0 ms (Data physically co-located in RAM on internal_part_num) **
+STAGE 3: MULTI-TABLE HASH JOIN ACROSS DISTRIBUTED KEYS
+  -> JOIN CHAKAN_SCM.ITEM_MASTER ON (internal_part_num)
+  -> JOIN CHAKAN_SCM.BILL_OF_MATERIALS ON (component_part_num)
+  -> JOIN CHAKAN_SCM.PRODUCTION_SCHEDULES ON (parent_part_num)
+  -> LEFT JOIN CHAKAN_SCM.WAREHOUSE_INVENTORY_LEDGER ON (internal_part_num)
 
 STAGE 4: ANALYTICAL AGGREGATION & STARVATION DEFICIT MATERIALIZATION
   -> COMPUTE TRUE PICKABLE ATP = wms_counted - allocated - quality_hold
-  -> COMPUTE HOURLY ASSEMBLY BURN RATE = (planned_output * qty_per_assy * (1 + scrap)) / 48.0
-  -> COMPUTE STARVATION HORIZON = LEAST(48.0, available_qty / hourly_burn_qty)
-  -> COMPUTE DOWNTIME LOSS = downtime_hours * downtime_burn_rate_inr_hr
-  -> COMPUTE HEADLINE MITIGATION ROI = (net_stoppage_loss - 45000.0) / 45000.0  --> 1,175x
+  -> COMPUTE HOURLY ASSEMBLY BURN RATE = ROUND(gross_required_qty / 48.0, 2)
+  -> COMPUTE STARVATION HORIZON = ROUND(LEAST(48.0, available_qty / hourly_burn_qty), 1)
+  -> COMPUTE DOWNTIME LOSS = ROUND(downtime_hours * downtime_burn_rate_inr_hr, 2)
+  -> COMPUTE HEADLINE MITIGATION ROI = ROUND((net_stoppage_loss - 45000.0) / 45000.0, 1)
 ----------------------------------------------------------------------------------------------------------------
-TOTAL ROUND-TRIP LATENCY: < 15.0 ms
+MEASURED ROUND-TRIP LATENCY ({compute_src}): {measured_ms:.2f} ms
 ----------------------------------------------------------------------------------------------------------------""",
             language="sql",
         )
@@ -1187,7 +1197,7 @@ def main() -> None:
             "1. Quarantine Blast-Radius Triage (Action Queue)",
             "2. Assembly Line Starvation & BOM Horizon",
             "3. Interactive 'What-If' Chaos Simulator (Live Stress-Test)",
-            "4. High-Scale Stress Benchmark (10,000+ Rows: 60x+ Speedup)",
+            "4. High-Scale Stress Benchmark (500 to 10,000 Rows)",
             "5. Financial ROI & Line-Stop Cost Engine (Boardroom Defense)",
             "6. Warehouse Phantom Inventory Audit",
             "7. Exasol Personal SQL & UDF Inspector",
