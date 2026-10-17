@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from decimal import Decimal
 import os
 from pathlib import Path
 import time
@@ -19,6 +20,14 @@ from src.exasol_engine.harmonizer_core import (
 load_dotenv()
 
 
+class ExasolBootstrapError(RuntimeError):
+    """Raised when DDL, UDF, view deployment or table loading fails or is incomplete."""
+
+
+class ExasolWriteError(RuntimeError):
+    """Raised when a planner write-back to Exasol fails while a live connection exists."""
+
+
 class ChakanExasolClient:
     """
     Manages connection to Exasol Personal via pyexasol and executes DDL, UDF registration,
@@ -35,6 +44,7 @@ class ChakanExasolClient:
         self.conn = None
         self.mode = "LOCAL_MIRROR"
         self.tables: Dict[str, pd.DataFrame] = {}
+        self.last_fallback_reason: str | None = None
 
     def connect(self) -> bool:
         try:
@@ -92,6 +102,13 @@ class ChakanExasolClient:
         return self.tables
 
     def bootstrap_exasol_schema_and_data(self) -> Tuple[str, float]:
+        """
+        Deploys DDL, Python3 UDFs and analytical views to Exasol and loads all tables.
+
+        Every statement failure is collected and raised together as ExasolBootstrapError.
+        After loading, row counts in Exasol are verified against the source frames so a
+        partial load can never be reported as success.
+        """
         t0 = time.perf_counter()
         self.ensure_data_loaded()
 
@@ -101,16 +118,21 @@ class ChakanExasolClient:
         if self.conn is not None:
             import re
             sql_dir = Path(__file__).parent
+            errors: list[str] = []
+
+            def run_stmt(label: str, stmt: str) -> None:
+                try:
+                    self.conn.execute(stmt)
+                except Exception as exc:  # collected and raised below
+                    first_line = stmt.strip().splitlines()[0][:90]
+                    errors.append(f"[{label}] {first_line} -> {type(exc).__name__}: {str(exc)[:240]}")
 
             # 1. DDL Schema
             ddl_sql = (sql_dir / "ddl_schema.sql").read_text(encoding="utf-8")
             for block in ddl_sql.split(";"):
                 clean = "\n".join([l for l in block.splitlines() if not l.strip().startswith("--")]).strip()
                 if clean:
-                    try:
-                        self.conn.execute(clean)
-                    except Exception:
-                        pass
+                    run_stmt("DDL", clean)
 
             # 2. Python 3 UDFs (delimited by /)
             udf_sql = (sql_dir / "udfs_harmonization.sql").read_text(encoding="utf-8")
@@ -123,45 +145,300 @@ class ChakanExasolClient:
                     clean_lines.append(l)
                 clean = "\n".join(clean_lines).strip().rstrip("/").rstrip(";").strip()
                 if clean:
-                    try:
-                        self.conn.execute(clean)
-                    except Exception:
-                        pass
+                    run_stmt("UDF", clean)
 
             # 3. Analytical Views
             views_sql = (sql_dir / "blast_radius_marts.sql").read_text(encoding="utf-8")
             for block in views_sql.split(";"):
                 clean = "\n".join([l for l in block.splitlines() if not l.strip().startswith("--")]).strip()
                 if clean:
-                    try:
-                        self.conn.execute(clean)
-                    except Exception:
-                        pass
+                    run_stmt("VIEW", clean)
 
-            # 4. Import Tables from Pandas
+            # 4. Import Tables from Pandas, then verify row counts
             for table_name, df in self.tables.items():
                 if len(df) > 0:
                     try:
                         self.conn.execute(f"TRUNCATE TABLE {self.schema}.{table_name}")
                         self.conn.import_from_pandas(df, (self.schema, table_name))
-                    except Exception:
-                        pass
+                        loaded = int(self.conn.execute(f"SELECT COUNT(*) FROM {self.schema}.{table_name}").fetchone()[0])
+                        if loaded != len(df):
+                            errors.append(f"[LOAD] {table_name}: expected {len(df)} rows, Exasol holds {loaded}")
+                    except Exception as exc:
+                        errors.append(f"[LOAD] {table_name} -> {type(exc).__name__}: {str(exc)[:240]}")
+
+            if errors:
+                raise ExasolBootstrapError(
+                    f"Exasol bootstrap failed with {len(errors)} error(s):\n  - " + "\n  - ".join(errors)
+                )
 
         elapsed_ms = round((time.perf_counter() - t0) * 1000.0, 2)
         return self.mode, elapsed_ms
+
+    def _build_triage_and_roi(
+        self, risk_df: pd.DataFrame, active_asns: pd.DataFrame, sched_df: pd.DataFrame
+    ) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+        """
+        Shared post-processing: ranks quarantined ASNs by blast radius and builds the ROI summary.
+        Inputs come either from the pandas mirror pipeline or from Exasol view results.
+        """
+        if "ordered_qty" not in risk_df.columns and "po_ordered_qty" in risk_df.columns:
+            risk_df = risk_df.assign(ordered_qty=risk_df["po_ordered_qty"])
+        # 4. Build Actionable Quarantine Triage Queue ranked by Blast Radius (Rs)
+        comp_blast = (
+            risk_df.groupby("component_part_num", as_index=False)
+            .agg(
+                affected_lines=("assembly_line_id", lambda s: ", ".join(sorted(set(s)))),
+                gross_required_qty=("gross_required_qty", "sum"),
+                true_pickable_atp_qty=("true_pickable_atp_qty", "first"),
+                phantom_inventory_qty=("phantom_inventory_qty", "first"),
+                po_ordered_qty=("ordered_qty", "first"),
+                min_hours_to_stop_legacy=("hours_to_starvation_legacy", "min"),
+                min_hours_to_stop_harmonized=("hours_to_starvation_harmonized", "min"),
+                revenue_at_risk_legacy_inr=("revenue_at_risk_legacy_inr", "sum"),
+                revenue_at_risk_net_inr=("revenue_at_risk_net_inr", "sum"),
+                true_net_deficit_qty=("true_net_deficit_qty", "sum"),
+                downtime_burn_rate_inr_hr=("downtime_burn_rate_inr_hr", "max"),
+                plant_idle_cost_inr=("plant_idle_cost_inr", "sum"),
+                total_stoppage_exposure_inr=("total_stoppage_exposure_inr", "sum"),
+                expedited_freight_cost_inr=("expedited_freight_cost_inr", "sum"),
+            )
+            .rename(columns={"component_part_num": "resolved_part_num"})
+        )
+
+        triage_queue = (
+            active_asns[active_asns["legacy_etl_status"] == "QUARANTINED"]
+            .merge(comp_blast, on="resolved_part_num", how="left")
+            .fillna(
+                {
+                    "affected_lines": "BUFFER_REPLENISHMENT",
+                    "revenue_at_risk_legacy_inr": 0.0,
+                    "revenue_at_risk_net_inr": 0.0,
+                    "true_net_deficit_qty": 0.0,
+                    "min_hours_to_stop_legacy": 48.0,
+                    "min_hours_to_stop_harmonized": 48.0,
+                    "downtime_burn_rate_inr_hr": 0.0,
+                    "plant_idle_cost_inr": 0.0,
+                    "total_stoppage_exposure_inr": 0.0,
+                    "expedited_freight_cost_inr": 0.0,
+                }
+            )
+        )
+
+        def classify_operational_outcome(r: pd.Series) -> str:
+            if int(r["transmission_seq"]) > 1:
+                return "DUPLICATE_PAYLOAD_SUPPRESSED"
+            if float(r["true_net_deficit_qty"]) > 0:
+                return "CRITICAL_SHORT_SHIPMENT_EXPOSED"
+            if float(r["revenue_at_risk_legacy_inr"]) > 0 and float(r["true_net_deficit_qty"]) == 0:
+                return "FALSE_STARVATION_CLEARED_BY_UDF"
+            return "HARMONIZED_BUFFER_RESTORED"
+
+        triage_queue["operational_verdict"] = triage_queue.apply(classify_operational_outcome, axis=1)
+        triage_queue["mitigation_roi_x"] = np.where(
+            triage_queue["expedited_freight_cost_inr"] > 0,
+            ((triage_queue["revenue_at_risk_net_inr"] - triage_queue["expedited_freight_cost_inr"]) / triage_queue["expedited_freight_cost_inr"]).round(1),
+            0.0,
+        )
+        triage_queue["avoided_panic_freight_inr"] = np.where(
+            triage_queue["operational_verdict"] == "FALSE_STARVATION_CLEARED_BY_UDF",
+            45000.0,
+            0.0,
+        )
+        triage_queue = triage_queue.sort_values(
+            by=["revenue_at_risk_legacy_inr", "true_net_deficit_qty"], ascending=[False, False]
+        )
+
+        # 5. Financial ROI Executive Summary Mart (Formulation 3 Boardroom Defense)
+        total_sched_val = float((sched_df["planned_output_units"] * sched_df["finished_unit_value_inr"]).sum())
+        legacy_risk = float(risk_df["revenue_at_risk_legacy_inr"].sum())
+        net_risk = float(risk_df["revenue_at_risk_net_inr"].sum())
+        cleared_val = max(0.0, legacy_risk - net_risk)
+        total_idle_loss = float(risk_df["plant_idle_cost_inr"].sum())
+        total_stoppage_loss = float(risk_df["total_stoppage_exposure_inr"].sum())
+        total_freight_cost = float(risk_df["expedited_freight_cost_inr"].sum())
+        benchmark_freight_inr = 45000.0
+        headline_roi_x = round((net_risk - benchmark_freight_inr) / benchmark_freight_inr, 1)
+        all_lines_roi_x = round((net_risk - total_freight_cost) / total_freight_cost, 1) if total_freight_cost > 0 else 0.0
+        total_financial_roi_x = round((total_stoppage_loss - total_freight_cost) / total_freight_cost, 1) if total_freight_cost > 0 else 0.0
+        false_alarms_cleared_count = int((triage_queue["operational_verdict"] == "FALSE_STARVATION_CLEARED_BY_UDF").sum())
+        avoided_panic_freight_total = max(135000.0, false_alarms_cleared_count * benchmark_freight_inr)
+
+        financial_roi_mart = {
+            "total_scheduled_value_inr": total_sched_val,
+            "legacy_risk_inr": legacy_risk,
+            "net_risk_inr": net_risk,
+            "cleared_by_udf_inr": cleared_val,
+            "total_idle_loss_inr": total_idle_loss,
+            "total_stoppage_exposure_inr": total_stoppage_loss,
+            "benchmark_freight_inr": benchmark_freight_inr,
+            "total_freight_cost_inr": total_freight_cost,
+            "headline_roi_x": headline_roi_x,
+            "all_lines_roi_x": all_lines_roi_x,
+            "total_financial_roi_x": total_financial_roi_x,
+            "false_alarms_cleared_count": false_alarms_cleared_count,
+            "avoided_panic_freight_inr": avoided_panic_freight_total,
+        }
+
+        return triage_queue, financial_roi_mart
+
+    def _fetch_df(self, sql: str) -> pd.DataFrame:
+        """Runs a query on Exasol over the active WebSocket session and returns a normalized DataFrame."""
+        stmt = self.conn.execute(sql)
+        cols = [str(c).lower() for c in stmt.column_names()]
+        rows = stmt.fetchall()
+        df = pd.DataFrame.from_records(rows, columns=cols)
+        for col in df.columns:
+            if df[col].dtype == object:
+                sample = df[col].dropna().head(20)
+                if len(sample) and all(isinstance(v, Decimal) for v in sample):
+                    df[col] = df[col].astype(float)
+        return df
+
+    def _make_telemetry(
+        self,
+        compute_source: str,
+        elapsed_ms: float,
+        stages: Dict[str, float],
+        table_row_counts: Dict[str, int],
+        total_asns: int,
+        sim_params: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        in_exasol = compute_source == "EXASOL_VIEWS"
+        return {
+            "engine_mode": "EXASOL_PERSONAL" if in_exasol else "LOCAL_MIRROR",
+            "compute_source": compute_source,
+            "connected_to_exasol": self.conn is not None,
+            "fallback_reason": self.last_fallback_reason,
+            "latency_ms": elapsed_ms,
+            "latency_sla_target_ms": 15.0,
+            "total_rows_evaluated": int(sum(table_row_counts.values())),
+            "total_asns": int(total_asns),
+            "table_row_counts": table_row_counts,
+            "colocation_key": "internal_part_num",
+            "colocation_keys": [
+                "internal_part_num",
+                "component_part_num",
+                "po_number_ref",
+                "parent_part_num",
+            ],
+            "colocation_status": "CO_LOCATED_ACTIVE" if in_exasol else "MIRROR_IN_PROCESS",
+            "mpp_network_hops": 0,
+            "ram_cache_status": "HOT_COLUMNAR_RAM" if in_exasol else "APP_PROCESS_MEMORY",
+            "udf_engine": "PYTHON3_IN_DB_RAM" if in_exasol else "PYTHON_APP_PROCESS",
+            "schema": self.schema,
+            "dsn": self.dsn,
+            "simulation_parameters": sim_params,
+            "is_simulated": bool(
+                int(sim_params["transit_delay_days"]) > 0
+                or float(sim_params["quarantine_defect_pct"]) > 0.0
+                or float(sim_params["demand_surge_multiplier"]) != 1.0
+            ),
+            "latency_stages_ms": stages,
+        }
+
+    def _compute_marts_from_exasol(self) -> Dict[str, Any]:
+        """
+        Baseline marts computed BY Exasol: inventory ATP, UDF-harmonized ASN lineage and BOM
+        starvation risk are read from the deployed views (which invoke the Python3 UDFs and
+        join planner overrides inside the database). Only the quarantine ranking and ROI
+        roll-up are post-processed in Python on those results.
+        """
+        if self.conn is None:
+            raise ExasolBootstrapError("No live Exasol connection available for view-based computation.")
+
+        self.ensure_data_loaded()
+        t0 = time.perf_counter()
+        s = self.schema
+        stages: Dict[str, float] = {}
+
+        def timed(name: str, sql: str) -> pd.DataFrame:
+            ts = time.perf_counter()
+            df = self._fetch_df(sql)
+            stages[name] = round((time.perf_counter() - ts) * 1000.0, 2)
+            return df
+
+        inv_mart = timed("view_inventory_true_atp", f"SELECT * FROM {s}.VW_INVENTORY_TRUE_ATP")
+        asn_joined = timed("view_asn_harmonized_lineage", f"SELECT * FROM {s}.VW_ASN_HARMONIZED_LINEAGE")
+        risk_df = timed("view_bom_line_starvation_risk", f"SELECT * FROM {s}.VW_BOM_LINE_STARVATION_RISK")
+
+        ts = time.perf_counter()
+        sched_df = self.tables["PRODUCTION_SCHEDULES"]
+        po_numbers = set(self.tables["PURCHASE_ORDER_LINES"]["po_number"])
+        table_row_counts = {
+            t: len(self.tables[t])
+            for t in (
+                "ASN_LINES_RAW",
+                "PURCHASE_ORDER_LINES",
+                "ITEM_MASTER",
+                "BILL_OF_MATERIALS",
+                "PRODUCTION_SCHEDULES",
+                "WAREHOUSE_INVENTORY_LEDGER",
+                "SUPPLIER_MASTER",
+                "ASN_PLANNER_OVERRIDES",
+            )
+        }
+        active_asns = asn_joined[asn_joined["po_number_ref"].isin(po_numbers)].copy()
+        triage_queue, financial_roi_mart = self._build_triage_and_roi(risk_df, active_asns, sched_df)
+        stages["python_triage_postprocess"] = round((time.perf_counter() - ts) * 1000.0, 2)
+
+        elapsed_ms = round((time.perf_counter() - t0) * 1000.0, 2)
+        sim_params = {"transit_delay_days": 0, "quarantine_defect_pct": 0.0, "demand_surge_multiplier": 1.0}
+        telemetry = self._make_telemetry(
+            "EXASOL_VIEWS", elapsed_ms, stages, table_row_counts, table_row_counts["ASN_LINES_RAW"], sim_params
+        )
+        return {
+            "engine_mode": "EXASOL_PERSONAL",
+            "compute_source": "EXASOL_VIEWS",
+            "query_latency_ms": elapsed_ms,
+            "inventory_mart": inv_mart,
+            "asn_lineage_mart": asn_joined,
+            "bom_risk_mart": risk_df,
+            "triage_queue": triage_queue,
+            "financial_roi_mart": financial_roi_mart,
+            "telemetry": telemetry,
+        }
 
     def compute_analytical_marts(
         self,
         transit_delay_days: int = 0,
         quarantine_defect_pct: float = 0.0,
         demand_surge_multiplier: float = 1.0,
+        source: str = "auto",
     ) -> Dict[str, Any]:
         """
-        Executes the 3-stage analytical pipeline (True ATP -> ASN UDF Harmonization -> BOM Blast Radius)
-        and returns structured DataFrames along with execution timing in milliseconds.
-        Supports parameter-driven 'What-If' chaos simulation (transit delays, quarantine spikes, surge demand).
+        Computes the analytical marts (True ATP -> ASN UDF harmonization -> BOM blast radius).
+
+        source:
+          - "auto":   baseline requests use Exasol views when a live connection exists; otherwise
+                      (or when simulation parameters are set) the pandas pipeline is used.
+          - "exasol": always use Exasol views; raises if unavailable.
+          - "pandas": always use the in-process pandas pipeline (offline fallback, simulation model).
+
+        The result always states where the numbers were computed in `compute_source`.
         """
+        sim_active = (
+            int(transit_delay_days) > 0
+            or float(quarantine_defect_pct) > 0.0
+            or float(demand_surge_multiplier) != 1.0
+        )
+        if source not in ("auto", "exasol", "pandas"):
+            raise ValueError(f"Unknown source '{source}'")
+        if source == "exasol" and sim_active:
+            raise ValueError("Simulation parameters are modeled client-side; use source='pandas' or 'auto'.")
+
+        if source == "exasol" or (source == "auto" and not sim_active and self.conn is not None):
+            try:
+                result = self._compute_marts_from_exasol()
+                self.last_fallback_reason = None
+                return result
+            except Exception as exc:
+                if source == "exasol":
+                    raise
+                self.last_fallback_reason = f"{type(exc).__name__}: {str(exc)[:200]}"
+
         t0 = time.perf_counter()
+        t_mark = t0
+        stage_ms: Dict[str, float] = {}
         self.ensure_data_loaded()
 
         sup_df = self.tables["SUPPLIER_MASTER"].copy()
@@ -191,6 +468,9 @@ class ChakanExasolClient:
             0.0,
             inv_mart["wms_physical_counted_qty"] - inv_mart["allocated_to_prod_qty"] - sim_quality_hold,
         )
+
+        stage_ms["inventory_mart"] = round((time.perf_counter() - t_mark) * 1000.0, 2)
+        t_mark = time.perf_counter()
 
         # 2. ASN UDF Harmonization & Deduplication Mart
         asn_sorted = asn_df.sort_values("ingested_at").copy()
@@ -316,6 +596,9 @@ class ChakanExasolClient:
         asn_joined["harmonized_eta_date"] = harmonized_etas
         asn_joined["harmonization_state"] = harm_states
 
+        stage_ms["asn_harmonization"] = round((time.perf_counter() - t_mark) * 1000.0, 2)
+        t_mark = time.perf_counter()
+
         # 3. BOM Explosion & Line Starvation Risk Mart
         active_asns = asn_joined[asn_joined["po_number_ref"].isin(po_df["po_number"])].copy()
 
@@ -430,152 +713,33 @@ class ChakanExasolClient:
             0.0,
         )
 
-        # 4. Build Actionable Quarantine Triage Queue ranked by Blast Radius (Rs)
-        comp_blast = (
-            risk_df.groupby("component_part_num", as_index=False)
-            .agg(
-                affected_lines=("assembly_line_id", lambda s: ", ".join(sorted(set(s)))),
-                gross_required_qty=("gross_required_qty", "sum"),
-                true_pickable_atp_qty=("true_pickable_atp_qty", "first"),
-                phantom_inventory_qty=("phantom_inventory_qty", "first"),
-                po_ordered_qty=("ordered_qty", "first"),
-                min_hours_to_stop_legacy=("hours_to_starvation_legacy", "min"),
-                min_hours_to_stop_harmonized=("hours_to_starvation_harmonized", "min"),
-                revenue_at_risk_legacy_inr=("revenue_at_risk_legacy_inr", "sum"),
-                revenue_at_risk_net_inr=("revenue_at_risk_net_inr", "sum"),
-                true_net_deficit_qty=("true_net_deficit_qty", "sum"),
-                downtime_burn_rate_inr_hr=("downtime_burn_rate_inr_hr", "max"),
-                plant_idle_cost_inr=("plant_idle_cost_inr", "sum"),
-                total_stoppage_exposure_inr=("total_stoppage_exposure_inr", "sum"),
-                expedited_freight_cost_inr=("expedited_freight_cost_inr", "sum"),
-            )
-            .rename(columns={"component_part_num": "resolved_part_num"})
-        )
-
-        triage_queue = (
-            active_asns[active_asns["legacy_etl_status"] == "QUARANTINED"]
-            .merge(comp_blast, on="resolved_part_num", how="left")
-            .fillna(
-                {
-                    "affected_lines": "BUFFER_REPLENISHMENT",
-                    "revenue_at_risk_legacy_inr": 0.0,
-                    "revenue_at_risk_net_inr": 0.0,
-                    "true_net_deficit_qty": 0.0,
-                    "min_hours_to_stop_legacy": 48.0,
-                    "min_hours_to_stop_harmonized": 48.0,
-                    "downtime_burn_rate_inr_hr": 0.0,
-                    "plant_idle_cost_inr": 0.0,
-                    "total_stoppage_exposure_inr": 0.0,
-                    "expedited_freight_cost_inr": 0.0,
-                }
-            )
-        )
-
-        def classify_operational_outcome(r: pd.Series) -> str:
-            if int(r["transmission_seq"]) > 1:
-                return "DUPLICATE_PAYLOAD_SUPPRESSED"
-            if float(r["true_net_deficit_qty"]) > 0:
-                return "CRITICAL_SHORT_SHIPMENT_EXPOSED"
-            if float(r["revenue_at_risk_legacy_inr"]) > 0 and float(r["true_net_deficit_qty"]) == 0:
-                return "FALSE_STARVATION_CLEARED_BY_UDF"
-            return "HARMONIZED_BUFFER_RESTORED"
-
-        triage_queue["operational_verdict"] = triage_queue.apply(classify_operational_outcome, axis=1)
-        triage_queue["mitigation_roi_x"] = np.where(
-            triage_queue["expedited_freight_cost_inr"] > 0,
-            ((triage_queue["revenue_at_risk_net_inr"] - triage_queue["expedited_freight_cost_inr"]) / triage_queue["expedited_freight_cost_inr"]).round(1),
-            0.0,
-        )
-        triage_queue["avoided_panic_freight_inr"] = np.where(
-            triage_queue["operational_verdict"] == "FALSE_STARVATION_CLEARED_BY_UDF",
-            45000.0,
-            0.0,
-        )
-        triage_queue = triage_queue.sort_values(
-            by=["revenue_at_risk_legacy_inr", "true_net_deficit_qty"], ascending=[False, False]
-        )
-
-        # 5. Financial ROI Executive Summary Mart (Formulation 3 Boardroom Defense)
-        total_sched_val = float((sched_df["planned_output_units"] * sched_df["finished_unit_value_inr"]).sum())
-        legacy_risk = float(risk_df["revenue_at_risk_legacy_inr"].sum())
-        net_risk = float(risk_df["revenue_at_risk_net_inr"].sum())
-        cleared_val = max(0.0, legacy_risk - net_risk)
-        total_idle_loss = float(risk_df["plant_idle_cost_inr"].sum())
-        total_stoppage_loss = float(risk_df["total_stoppage_exposure_inr"].sum())
-        total_freight_cost = float(risk_df["expedited_freight_cost_inr"].sum())
-        benchmark_freight_inr = 45000.0
-        headline_roi_x = round((net_risk - benchmark_freight_inr) / benchmark_freight_inr, 1)
-        all_lines_roi_x = round((net_risk - total_freight_cost) / total_freight_cost, 1) if total_freight_cost > 0 else 0.0
-        total_financial_roi_x = round((total_stoppage_loss - total_freight_cost) / total_freight_cost, 1) if total_freight_cost > 0 else 0.0
-        false_alarms_cleared_count = int((triage_queue["operational_verdict"] == "FALSE_STARVATION_CLEARED_BY_UDF").sum())
-        avoided_panic_freight_total = max(135000.0, false_alarms_cleared_count * benchmark_freight_inr)
-
-        financial_roi_mart = {
-            "total_scheduled_value_inr": total_sched_val,
-            "legacy_risk_inr": legacy_risk,
-            "net_risk_inr": net_risk,
-            "cleared_by_udf_inr": cleared_val,
-            "total_idle_loss_inr": total_idle_loss,
-            "total_stoppage_exposure_inr": total_stoppage_loss,
-            "benchmark_freight_inr": benchmark_freight_inr,
-            "total_freight_cost_inr": total_freight_cost,
-            "headline_roi_x": headline_roi_x,
-            "all_lines_roi_x": all_lines_roi_x,
-            "total_financial_roi_x": total_financial_roi_x,
-            "false_alarms_cleared_count": false_alarms_cleared_count,
-            "avoided_panic_freight_inr": avoided_panic_freight_total,
-        }
+        stage_ms["bom_risk_mart"] = round((time.perf_counter() - t_mark) * 1000.0, 2)
+        t_mark = time.perf_counter()
+        triage_queue, financial_roi_mart = self._build_triage_and_roi(risk_df, active_asns, sched_df)
+        stage_ms["triage_and_roi"] = round((time.perf_counter() - t_mark) * 1000.0, 2)
 
         elapsed_ms = round((time.perf_counter() - t0) * 1000.0, 2)
-        total_rows_evaluated = (
-            len(sup_df)
-            + len(item_df)
-            + len(bom_df)
-            + len(sched_df)
-            + len(inv_df)
-            + len(po_df)
-            + len(asn_df)
-            + len(ov_df)
-        )
-        telemetry = {
-            "engine_mode": self.mode,
-            "latency_ms": elapsed_ms,
-            "latency_sla_target_ms": 15.0,
-            "total_rows_evaluated": total_rows_evaluated,
-            "total_asns": len(asn_df),
-            "table_row_counts": {
-                "ASN_LINES_RAW": len(asn_df),
-                "PURCHASE_ORDER_LINES": len(po_df),
-                "ITEM_MASTER": len(item_df),
-                "BILL_OF_MATERIALS": len(bom_df),
-                "PRODUCTION_SCHEDULES": len(sched_df),
-                "WAREHOUSE_INVENTORY_LEDGER": len(inv_df),
-                "SUPPLIER_MASTER": len(sup_df),
-                "ASN_PLANNER_OVERRIDES": len(ov_df),
-            },
-            "colocation_key": "internal_part_num",
-            "colocation_status": "CO_LOCATED_ACTIVE",
-            "mpp_network_hops": 0,
-            "ram_cache_status": "HOT_COLUMNAR_RAM",
-            "udf_engine": "PYTHON3_IN_DB_RAM",
-            "schema": self.schema,
-            "dsn": self.dsn,
-            "simulation_parameters": {
-                "transit_delay_days": int(transit_delay_days),
-                "quarantine_defect_pct": float(quarantine_defect_pct),
-                "demand_surge_multiplier": float(demand_surge_multiplier),
-            },
-            "is_simulated": bool(int(transit_delay_days) > 0 or float(quarantine_defect_pct) > 0.0 or float(demand_surge_multiplier) != 1.0),
-            "latency_stages_ms": {
-                "raw_scan_and_dedup": round(elapsed_ms * 0.16, 2),
-                "in_db_udf_harmonization": round(elapsed_ms * 0.46, 2),
-                "colocated_bom_join": round(elapsed_ms * 0.24, 2),
-                "blast_radius_aggregation": round(elapsed_ms * 0.14, 2),
-            },
+        table_row_counts = {
+            "ASN_LINES_RAW": len(asn_df),
+            "PURCHASE_ORDER_LINES": len(po_df),
+            "ITEM_MASTER": len(item_df),
+            "BILL_OF_MATERIALS": len(bom_df),
+            "PRODUCTION_SCHEDULES": len(sched_df),
+            "WAREHOUSE_INVENTORY_LEDGER": len(inv_df),
+            "SUPPLIER_MASTER": len(sup_df),
+            "ASN_PLANNER_OVERRIDES": len(ov_df),
         }
+        sim_params = {
+            "transit_delay_days": int(transit_delay_days),
+            "quarantine_defect_pct": float(quarantine_defect_pct),
+            "demand_surge_multiplier": float(demand_surge_multiplier),
+        }
+        compute_source = "PANDAS_SIMULATION" if sim_active else "PANDAS_MIRROR"
+        telemetry = self._make_telemetry(compute_source, elapsed_ms, stage_ms, table_row_counts, len(asn_df), sim_params)
 
         return {
-            "engine_mode": self.mode,
+            "engine_mode": "LOCAL_MIRROR",
+            "compute_source": compute_source,
             "query_latency_ms": elapsed_ms,
             "inventory_mart": inv_mart,
             "asn_lineage_mart": asn_joined,
@@ -584,6 +748,7 @@ class ChakanExasolClient:
             "financial_roi_mart": financial_roi_mart,
             "telemetry": telemetry,
         }
+
 
     def compute_simulation_marts(
         self,
@@ -595,8 +760,8 @@ class ChakanExasolClient:
         Computes side-by-side comparative analytics: Baseline state vs Simulated Chaos state.
         Demonstrates Exasol in-memory sub-second recalculation under dynamic supply chain disruptions.
         """
-        baseline = self.compute_analytical_marts(0, 0.0, 1.0)
-        simulated = self.compute_analytical_marts(transit_delay_days, quarantine_defect_pct, demand_surge_multiplier)
+        baseline = self.compute_analytical_marts(0, 0.0, 1.0, source="pandas")
+        simulated = self.compute_analytical_marts(transit_delay_days, quarantine_defect_pct, demand_surge_multiplier, source="pandas")
 
         base_net = float(baseline["financial_roi_mart"]["net_risk_inr"])
         sim_net = float(simulated["financial_roi_mart"]["net_risk_inr"])
@@ -610,16 +775,22 @@ class ChakanExasolClient:
         sim_min_hrs = float(simulated["bom_risk_mart"]["hours_to_starvation_harmonized"].min())
         delta_hrs = round(sim_min_hrs - base_min_hrs, 1)
 
-        transit_only = self.compute_analytical_marts(transit_delay_days, 0.0, 1.0)
-        quarantine_only = self.compute_analytical_marts(0, quarantine_defect_pct, 1.0)
-        surge_only = self.compute_analytical_marts(0, 0.0, demand_surge_multiplier)
+        step1_delay = self.compute_analytical_marts(transit_delay_days, 0.0, 1.0, source="pandas")
+        step2_delay_quarantine = self.compute_analytical_marts(
+            transit_delay_days, quarantine_defect_pct, 1.0, source="pandas"
+        )
+
+        s0 = round(base_net, 2)
+        s1 = round(float(step1_delay["financial_roi_mart"]["net_risk_inr"]), 2)
+        s2 = round(float(step2_delay_quarantine["financial_roi_mart"]["net_risk_inr"]), 2)
+        s3 = round(sim_net, 2)
 
         waterfall_data = [
-            {"Stage": "1. Baseline True Shortage", "Amount": base_net, "Type": "relative"},
-            {"Stage": "2. Logistics Transit Drift", "Amount": max(0.0, float(transit_only["financial_roi_mart"]["net_risk_inr"]) - base_net), "Type": "relative"},
-            {"Stage": "3. Quarantine Defect Spike", "Amount": max(0.0, float(quarantine_only["financial_roi_mart"]["net_risk_inr"]) - base_net), "Type": "relative"},
-            {"Stage": "4. Surge Output Demand", "Amount": max(0.0, float(surge_only["financial_roi_mart"]["net_risk_inr"]) - base_net), "Type": "relative"},
-            {"Stage": "Total Simulated Exposure", "Amount": sim_net, "Type": "total"},
+            {"Stage": "1. Baseline True Shortage", "Amount": s0, "Type": "relative"},
+            {"Stage": "2. Logistics Transit Drift", "Amount": round(s1 - s0, 2), "Type": "relative"},
+            {"Stage": "3. Quarantine Defect Spike", "Amount": round(s2 - s1, 2), "Type": "relative"},
+            {"Stage": "4. Surge Output Demand", "Amount": round(s3 - s2, 2), "Type": "relative"},
+            {"Stage": "Total Simulated Exposure", "Amount": s3, "Type": "total"},
         ]
 
         return {
@@ -672,11 +843,12 @@ class ChakanExasolClient:
         if self.conn is not None:
             try:
                 self.conn.execute(
-                    f"DELETE FROM {self.schema}.ASN_PLANNER_OVERRIDES WHERE asn_line_id = '{asn_line_id}'"
+                    f"DELETE FROM {self.schema}.ASN_PLANNER_OVERRIDES WHERE asn_line_id = {{asn_line_id}}",
+                    {"asn_line_id": asn_line_id},
                 )
                 self.conn.import_from_pandas(new_row, (self.schema, "ASN_PLANNER_OVERRIDES"))
-            except Exception:
-                pass
+            except Exception as exc:
+                raise ExasolWriteError(f"Planner override for {asn_line_id} could not be written to Exasol: {exc}") from exc
 
         return round((time.perf_counter() - t0) * 1000.0, 2)
 
@@ -701,8 +873,9 @@ class ChakanExasolClient:
         if self.conn is not None:
             try:
                 self.conn.execute(f"TRUNCATE TABLE {self.schema}.ASN_PLANNER_OVERRIDES")
-            except Exception:
-                pass
+            except Exception as exc:
+                raise ExasolWriteError(f"Planner overrides could not be reset in Exasol: {exc}") from exc
 
         return round((time.perf_counter() - t0) * 1000.0, 2)
+
 
