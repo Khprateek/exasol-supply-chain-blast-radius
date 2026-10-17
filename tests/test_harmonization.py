@@ -130,4 +130,51 @@ def test_telemetry_and_query_profiler(tmp_path) -> None:
     assert counts["BILL_OF_MATERIALS"] >= 15
 
 
+def test_what_if_scenario_simulation(tmp_path) -> None:
+    client = ChakanExasolClient(data_dir=str(tmp_path))
+
+    # 1. Null Shock (Zero chaos parameters must equal baseline exactly)
+    null_sim = client.compute_simulation_marts(
+        transit_delay_days=0,
+        quarantine_defect_pct=0.0,
+        demand_surge_multiplier=1.0,
+    )
+    assert null_sim["delta_net_risk_inr"] == 0.0
+    assert null_sim["delta_total_exposure_inr"] == 0.0
+    assert null_sim["delta_min_hours_to_halt"] == 0.0
+
+    # 2. Compound Disruption Shock (+3 days delay, 20% quarantine defect, 1.25x demand surge)
+    shock_sim = client.compute_simulation_marts(
+        transit_delay_days=3,
+        quarantine_defect_pct=0.20,
+        demand_surge_multiplier=1.25,
+    )
+
+    base_net = shock_sim["baseline"]["financial_roi_mart"]["net_risk_inr"]
+    sim_net = shock_sim["simulated"]["financial_roi_mart"]["net_risk_inr"]
+    assert sim_net > base_net
+    assert shock_sim["delta_net_risk_inr"] > 0
+    assert shock_sim["delta_total_exposure_inr"] > 0
+
+    # Check Waterfall Stages
+    wf = shock_sim["waterfall_data"]
+    assert len(wf) == 5
+    assert wf[0]["Stage"] == "1. Baseline True Shortage"
+    assert wf[0]["Amount"] == base_net
+    assert wf[1]["Stage"] == "2. Logistics Transit Drift"
+    assert wf[1]["Amount"] > 0
+    assert wf[2]["Stage"] == "3. Quarantine Defect Spike"
+    assert wf[2]["Amount"] > 0
+    assert wf[3]["Stage"] == "4. Surge Output Demand"
+    assert wf[3]["Amount"] > 0
+    assert wf[4]["Stage"] == "Total Simulated Exposure"
+    assert wf[4]["Amount"] == sim_net
+
+    # Starvation run hours must be reduced or equal under shock
+    base_hrs = shock_sim["baseline"]["bom_risk_mart"]["hours_to_starvation_harmonized"]
+    sim_hrs = shock_sim["simulated"]["bom_risk_mart"]["hours_to_starvation_harmonized"]
+    assert (sim_hrs <= base_hrs).all()
+
+
+
 

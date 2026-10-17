@@ -150,10 +150,16 @@ class ChakanExasolClient:
         elapsed_ms = round((time.perf_counter() - t0) * 1000.0, 2)
         return self.mode, elapsed_ms
 
-    def compute_analytical_marts(self) -> Dict[str, Any]:
+    def compute_analytical_marts(
+        self,
+        transit_delay_days: int = 0,
+        quarantine_defect_pct: float = 0.0,
+        demand_surge_multiplier: float = 1.0,
+    ) -> Dict[str, Any]:
         """
         Executes the 3-stage analytical pipeline (True ATP -> ASN UDF Harmonization -> BOM Blast Radius)
         and returns structured DataFrames along with execution timing in milliseconds.
+        Supports parameter-driven 'What-If' chaos simulation (transit delays, quarantine spikes, surge demand).
         """
         t0 = time.perf_counter()
         self.ensure_data_loaded()
@@ -167,6 +173,9 @@ class ChakanExasolClient:
         asn_df = self.tables["ASN_LINES_RAW"].copy()
         ov_df = self.tables["ASN_PLANNER_OVERRIDES"].copy()
 
+        if float(demand_surge_multiplier) != 1.0:
+            sched_df["planned_output_units"] = (sched_df["planned_output_units"] * float(demand_surge_multiplier)).round(0)
+
         # 1. True ATP & Phantom Inventory Mart
         inv_mart = inv_df.merge(
             item_df[["internal_part_num", "part_description", "part_category", "base_uom", "standard_cost_inr", "safety_stock_qty"]],
@@ -176,9 +185,11 @@ class ChakanExasolClient:
         inv_mart["phantom_inventory_qty"] = inv_mart["erp_system_on_hand_qty"] - inv_mart["wms_physical_counted_qty"]
         inv_mart["phantom_inventory_value_inr"] = (inv_mart["phantom_inventory_qty"] * inv_mart["standard_cost_inr"]).round(2)
         inv_mart["erp_apparent_atp_qty"] = np.maximum(0.0, inv_mart["erp_system_on_hand_qty"] - inv_mart["allocated_to_prod_qty"])
+
+        sim_quality_hold = inv_mart["quality_hold_qty"] * (1.0 + float(quarantine_defect_pct) * 2.0)
         inv_mart["true_pickable_atp_qty"] = np.maximum(
             0.0,
-            inv_mart["wms_physical_counted_qty"] - inv_mart["allocated_to_prod_qty"] - inv_mart["quality_hold_qty"],
+            inv_mart["wms_physical_counted_qty"] - inv_mart["allocated_to_prod_qty"] - sim_quality_hold,
         )
 
         # 2. ASN UDF Harmonization & Deduplication Mart
@@ -269,6 +280,12 @@ class ChakanExasolClient:
 
         # 3. BOM Explosion & Line Starvation Risk Mart
         active_asns = asn_joined[asn_joined["po_number_ref"].isin(po_df["po_number"])].copy()
+
+        if int(transit_delay_days) > 0 or float(quarantine_defect_pct) > 0.0:
+            inbound_factor = max(0.0, 1.0 - (float(transit_delay_days) * 0.18)) * max(0.0, 1.0 - float(quarantine_defect_pct))
+            active_asns["harmonized_shipped_qty"] = (active_asns["harmonized_shipped_qty"] * inbound_factor).round(2)
+            active_asns["legacy_visible_qty"] = (active_asns["legacy_visible_qty"] * inbound_factor).round(2)
+
         po_rollup = (
             active_asns.groupby("po_number_ref", as_index=False)
             .agg(
@@ -505,6 +522,12 @@ class ChakanExasolClient:
             "udf_engine": "PYTHON3_IN_DB_RAM",
             "schema": self.schema,
             "dsn": self.dsn,
+            "simulation_parameters": {
+                "transit_delay_days": int(transit_delay_days),
+                "quarantine_defect_pct": float(quarantine_defect_pct),
+                "demand_surge_multiplier": float(demand_surge_multiplier),
+            },
+            "is_simulated": bool(int(transit_delay_days) > 0 or float(quarantine_defect_pct) > 0.0 or float(demand_surge_multiplier) != 1.0),
             "latency_stages_ms": {
                 "raw_scan_and_dedup": round(elapsed_ms * 0.16, 2),
                 "in_db_udf_harmonization": round(elapsed_ms * 0.46, 2),
@@ -522,6 +545,57 @@ class ChakanExasolClient:
             "triage_queue": triage_queue,
             "financial_roi_mart": financial_roi_mart,
             "telemetry": telemetry,
+        }
+
+    def compute_simulation_marts(
+        self,
+        transit_delay_days: int = 0,
+        quarantine_defect_pct: float = 0.0,
+        demand_surge_multiplier: float = 1.0,
+    ) -> Dict[str, Any]:
+        """
+        Computes side-by-side comparative analytics: Baseline state vs Simulated Chaos state.
+        Demonstrates Exasol in-memory sub-second recalculation under dynamic supply chain disruptions.
+        """
+        baseline = self.compute_analytical_marts(0, 0.0, 1.0)
+        simulated = self.compute_analytical_marts(transit_delay_days, quarantine_defect_pct, demand_surge_multiplier)
+
+        base_net = float(baseline["financial_roi_mart"]["net_risk_inr"])
+        sim_net = float(simulated["financial_roi_mart"]["net_risk_inr"])
+        delta_net = sim_net - base_net
+
+        base_exposure = float(baseline["financial_roi_mart"]["total_stoppage_exposure_inr"])
+        sim_exposure = float(simulated["financial_roi_mart"]["total_stoppage_exposure_inr"])
+        delta_exposure = sim_exposure - base_exposure
+
+        base_min_hrs = float(baseline["bom_risk_mart"]["hours_to_starvation_harmonized"].min())
+        sim_min_hrs = float(simulated["bom_risk_mart"]["hours_to_starvation_harmonized"].min())
+        delta_hrs = round(sim_min_hrs - base_min_hrs, 1)
+
+        transit_only = self.compute_analytical_marts(transit_delay_days, 0.0, 1.0)
+        quarantine_only = self.compute_analytical_marts(0, quarantine_defect_pct, 1.0)
+        surge_only = self.compute_analytical_marts(0, 0.0, demand_surge_multiplier)
+
+        waterfall_data = [
+            {"Stage": "1. Baseline True Shortage", "Amount": base_net, "Type": "relative"},
+            {"Stage": "2. Logistics Transit Drift", "Amount": max(0.0, float(transit_only["financial_roi_mart"]["net_risk_inr"]) - base_net), "Type": "relative"},
+            {"Stage": "3. Quarantine Defect Spike", "Amount": max(0.0, float(quarantine_only["financial_roi_mart"]["net_risk_inr"]) - base_net), "Type": "relative"},
+            {"Stage": "4. Surge Output Demand", "Amount": max(0.0, float(surge_only["financial_roi_mart"]["net_risk_inr"]) - base_net), "Type": "relative"},
+            {"Stage": "Total Simulated Exposure", "Amount": sim_net, "Type": "total"},
+        ]
+
+        return {
+            "baseline": baseline,
+            "simulated": simulated,
+            "delta_net_risk_inr": delta_net,
+            "delta_total_exposure_inr": delta_exposure,
+            "delta_min_hours_to_halt": delta_hrs,
+            "waterfall_data": waterfall_data,
+            "simulation_parameters": {
+                "transit_delay_days": int(transit_delay_days),
+                "quarantine_defect_pct": float(quarantine_defect_pct),
+                "demand_surge_multiplier": float(demand_surge_multiplier),
+            },
         }
 
     def approve_harmonization_override(
