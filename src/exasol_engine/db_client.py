@@ -40,15 +40,30 @@ class ChakanExasolClient:
         try:
             import pyexasol  # type: ignore
 
-            self.conn = pyexasol.connect(
-                dsn=self.dsn,
-                user=self.user,
-                password=self.password,
-                schema=self.schema,
-                encryption=os.getenv("EXASOL_ENCRYPTION", "True").lower() == "true",
-                websocket_sslopt={"cert_reqs": 0},
-                 compression=True,
-            )
+            encryption = os.getenv("EXASOL_ENCRYPTION", "True").lower() == "true"
+            try:
+                self.conn = pyexasol.connect(
+                    dsn=self.dsn,
+                    user=self.user,
+                    password=self.password,
+                    schema=self.schema,
+                    encryption=encryption,
+                    websocket_sslopt={"cert_reqs": 0},
+                    compression=True,
+                )
+            except Exception:
+                # If target schema does not exist yet, connect to system and initialize schema
+                self.conn = pyexasol.connect(
+                    dsn=self.dsn,
+                    user=self.user,
+                    password=self.password,
+                    encryption=encryption,
+                    websocket_sslopt={"cert_reqs": 0},
+                    compression=True,
+                )
+                self.conn.execute(f"CREATE SCHEMA IF NOT EXISTS {self.schema}")
+                self.conn.execute(f"OPEN SCHEMA {self.schema}")
+
             self.mode = "EXASOL_PERSONAL"
             return True
         except Exception:
@@ -84,16 +99,46 @@ class ChakanExasolClient:
             self.connect()
 
         if self.conn is not None:
+            import re
             sql_dir = Path(__file__).parent
-            for sql_file in ("ddl_schema.sql", "udfs_harmonization.sql", "blast_radius_marts.sql"):
-                raw_sql = (sql_dir / sql_file).read_text(encoding="utf-8")
-                statements = [s.strip() for s in raw_sql.split(";") if s.strip() and not s.strip().startswith("--")]
-                for stmt in statements:
+
+            # 1. DDL Schema
+            ddl_sql = (sql_dir / "ddl_schema.sql").read_text(encoding="utf-8")
+            for block in ddl_sql.split(";"):
+                clean = "\n".join([l for l in block.splitlines() if not l.strip().startswith("--")]).strip()
+                if clean:
                     try:
-                        self.conn.execute(stmt)
+                        self.conn.execute(clean)
                     except Exception:
                         pass
 
+            # 2. Python 3 UDFs (delimited by /)
+            udf_sql = (sql_dir / "udfs_harmonization.sql").read_text(encoding="utf-8")
+            udf_blocks = [b.strip() for b in re.split(r"\n/\s*\n", udf_sql) if b.strip()]
+            for b in udf_blocks:
+                clean_lines = []
+                for l in b.splitlines():
+                    if l.strip().startswith("--") or l.strip().upper().startswith("OPEN SCHEMA"):
+                        continue
+                    clean_lines.append(l)
+                clean = "\n".join(clean_lines).strip().rstrip("/").rstrip(";").strip()
+                if clean:
+                    try:
+                        self.conn.execute(clean)
+                    except Exception:
+                        pass
+
+            # 3. Analytical Views
+            views_sql = (sql_dir / "blast_radius_marts.sql").read_text(encoding="utf-8")
+            for block in views_sql.split(";"):
+                clean = "\n".join([l for l in block.splitlines() if not l.strip().startswith("--")]).strip()
+                if clean:
+                    try:
+                        self.conn.execute(clean)
+                    except Exception:
+                        pass
+
+            # 4. Import Tables from Pandas
             for table_name, df in self.tables.items():
                 if len(df) > 0:
                     try:
